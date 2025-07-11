@@ -13,9 +13,13 @@ A Go application that receives webhooks from Gitea and automatically adds commen
 
 ## Configuration
 
-The application expects a TOML configuration file. By default, it looks for `/etc/gitea-jira-webhook/config.toml`, but you can specify a different path using the `CONFIG_FILE_PATH` environment variable.
+The application expects a TOML configuration file. The configuration file path is determined in the following order of precedence:
+
+1. Command line flag: `-config /path/to/config.toml`
+2. Default location: `/etc/gitea-jira-webhook/config.toml`
 
 Example configuration:
+
 ```toml
 [jira]
 api_url = "https://your-jira-instance.atlassian.net/rest/api/3"
@@ -66,6 +70,36 @@ rm go.??? ; rm -rf vendor ; go mod init ; go get -u && go mod tidy && go mod ven
 ```
 
 ## Usage
+
+### Command Line Options
+
+```bash
+./go-gitea-jira-webhook [options]
+```
+
+Available options:
+
+- `-version` - Show version information
+- `-help` - Show help information with all available options and their defaults
+- `-config string` - Path to configuration file (default: "/etc/gitea-jira-webhook/config.toml")
+
+Examples:
+
+```bash
+# Show help
+./go-gitea-jira-webhook -help
+
+# Show version
+./go-gitea-jira-webhook -version
+
+# Use custom config file
+./go-gitea-jira-webhook -config /path/to/my-config.toml
+
+# Run with default settings
+./go-gitea-jira-webhook
+```
+
+### Setup Steps
 
 1. Configure your TOML configuration file
 2. Build the binary using the build command above

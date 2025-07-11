@@ -25,6 +25,9 @@ var (
 	buildversion = "unknown"
 )
 
+// Default configuration file path
+const defaultConfigPath = "/etc/gitea-jira-webhook/config.toml"
+
 // Config represents the structure of our TOML configuration file
 type Config struct {
 	Jira struct {
@@ -47,16 +50,14 @@ type Config struct {
 // Global variables to hold configuration and compiled regex
 var (
 	appConfig       Config
+	configPath      string
 	jiraTicketRegex *regexp.Regexp
 )
 
 func init() {
-	// 1. Determine config file path from environment variable or default
-	configPath := os.Getenv("CONFIG_FILE_PATH")
 	if configPath == "" {
 		// As per requirement, expect it under /etc/gitea-jira-webhook/config.toml
-		configPath = "/etc/gitea-jira-webhook/config.toml"
-		log.Printf("CONFIG_FILE_PATH environment variable not set, defaulting to %s", configPath)
+		configPath = defaultConfigPath
 	}
 
 	// 2. Load configuration from TOML file
@@ -383,14 +384,37 @@ func addCommitLinkToJira(jiraTicketID, commitURL, commitMessage, commitID, repoU
 }
 
 func main() {
-	// Parse version flag
-	versionFlag := flag.Bool("version", false, "Show version information")
+	// Define command line flags
+	var (
+		versionFlag = flag.Bool("version", false, "Show version information")
+		helpFlag    = flag.Bool("help", false, "Show help information")
+		configFlag  = flag.String("config", defaultConfigPath, "Path to configuration file")
+	)
+
 	flag.Parse()
+
+	if *helpFlag {
+		fmt.Printf("Go Gitea Jira Webhook - Receives Gitea webhooks and adds comments to Jira tickets\n\n")
+		fmt.Printf("Usage: %s [options]\n\n", os.Args[0])
+		fmt.Printf("Options:\n")
+		fmt.Printf("  -version          Show version information (default: false)\n")
+		fmt.Printf("  -help             Show this help message (default: false)\n")
+		fmt.Printf("  -config string    Path to configuration file (default: \"%s\")\n", defaultConfigPath)
+		fmt.Printf("\nExample:\n")
+		fmt.Printf("  %s -config /path/to/config.toml\n", os.Args[0])
+		fmt.Printf("  %s -version\n", os.Args[0])
+		return
+	}
 
 	if *versionFlag {
 		fmt.Printf("Build version: %s\n", buildversion)
 		fmt.Printf("Build time: %s\n", buildtime)
 		return
+	}
+
+	// Override config path if provided via command line
+	if *configFlag != defaultConfigPath {
+		configPath = *configFlag
 	}
 
 	http.HandleFunc("/gitea-webhook", giteaWebhookHandler)
