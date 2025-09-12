@@ -2,6 +2,7 @@
 api_url = "https://your-jira-instance.atlassian.net/rest/api/3"
 username = "your-jira-username"
 password = "your-jira-password"
+# projects_filter = ["PROJECTFOO", "PROJECTBAR"]  # Optional: Only process tickets from these projects
 
 [gitea]
 webhook_secret = "your-webhook-secret"  # Optional
