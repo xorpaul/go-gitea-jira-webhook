@@ -1,0 +1,14 @@
+[jira]
+api_url = "https://your-jira-instance.atlassian.net/rest/api/3"
+username = "your-jira-username"
+password = "your-jira-password"
+
+[gitea]
+webhook_secret = "your-webhook-secret"  # Optional
+
+[ssl]
+cert_file = "/path/to/cert.pem"
+key_file = "/path/to/key.pem"
+
+[server]
+port = "8443"

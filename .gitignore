@@ -1,4 +1,4 @@
 go-gitea-jira-webhook
-private.yaml
+private.toml
 ssl/
 
