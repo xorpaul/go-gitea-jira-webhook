@@ -13,11 +13,20 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml" // Import the TOML library
 )
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 // Build version variables - set via ldflags during build
 var (
@@ -26,14 +35,25 @@ var (
 )
 
 // Default configuration file path
-const defaultConfigPath = "/etc/gitea-jira-webhook/config.toml"
+const defaultConfigPath = "/etc/go-gitea-jira-webhook/config.toml"
+
+// Default token cache file path
+var defaultTokenCachePath = func() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" {
+		// Fallback to current directory if home cannot be determined
+		return "go-gitea-jira-webhook-token.cache"
+	}
+	return homeDir + "/.go-gitea-jira-webhook-token.cache"
+}()
 
 // Config represents the structure of our TOML configuration file
 type Config struct {
 	Jira struct {
-		APIURL   string `toml:"api_url"`
-		Username string `toml:"username"`
-		APIToken string `toml:"api_token"`
+		APIURL         string   `toml:"api_url"`
+		Username       string   `toml:"username"`
+		Password       string   `toml:"password"`
+		ProjectsFilter []string `toml:"projects_filter"` // Optional: only process tickets from these projects
 	} `toml:"jira"`
 	Gitea struct {
 		WebhookSecret string `toml:"webhook_secret"` // Optional
@@ -47,52 +67,355 @@ type Config struct {
 	} `toml:"server"`
 }
 
+// JiraAPIToken represents the response from Jira API token creation
+type JiraAPIToken struct {
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	CreatedAt  string `json:"createdAt"`
+	ExpiringAt string `json:"expiringAt"`
+	RawToken   string `json:"rawToken"`
+}
+
+// CachedToken represents a cached API token with metadata
+type CachedToken struct {
+	Token      string `json:"token"`
+	CreatedAt  string `json:"created_at"`
+	ExpiryDate string `json:"expiry_date"`
+	Username   string `json:"username"`
+	APIURL     string `json:"api_url"`
+}
+
+// CommitInfo represents information about a single commit for bundling
+type CommitInfo struct {
+	ID        string
+	Message   string
+	URL       string
+	ShortID   string
+	Timestamp string // ISO 8601 timestamp from Gitea
+}
+
+// TicketCommits represents all commits associated with a specific Jira ticket
+type TicketCommits struct {
+	TicketID string
+	Commits  []CommitInfo
+	RepoURL  string
+	RepoName string
+}
+
 // Global variables to hold configuration and compiled regex
 var (
 	appConfig       Config
-	configPath      string
+	jiraAPIToken    string // Store the generated API token
 	jiraTicketRegex *regexp.Regexp
 )
 
-func init() {
-	if configPath == "" {
-		// As per requirement, expect it under /etc/gitea-jira-webhook/config.toml
-		configPath = defaultConfigPath
-	}
-
-	// 2. Load configuration from TOML file
+// loadConfiguration loads and validates the configuration from the specified file
+func loadConfiguration(configPath string) error {
+	// Load configuration from TOML file
 	if _, err := toml.DecodeFile(configPath, &appConfig); err != nil {
-		log.Fatalf("Error loading configuration from %s: %v", configPath, err)
+		return fmt.Errorf("error loading configuration from %s: %v", configPath, err)
 	}
 
-	// 3. Validate essential config fields
+	// Validate essential config fields
 	if appConfig.Jira.APIURL == "" {
-		log.Fatal("Jira.APIURL is not set in the configuration file.")
+		return fmt.Errorf("Jira.APIURL is not set in the configuration file")
 	}
 	if appConfig.Jira.Username == "" {
-		log.Fatal("Jira.Username is not set in the configuration file.")
+		return fmt.Errorf("Jira.Username is not set in the configuration file")
 	}
-	if appConfig.Jira.APIToken == "" {
-		log.Fatal("Jira.APIToken is not set in the configuration file.")
+	if appConfig.Jira.Password == "" {
+		return fmt.Errorf("Jira.Password is not set in the configuration file")
 	}
 	if appConfig.SSL.CertFile == "" {
-		log.Fatal("SSL.CertFile is not set in the configuration file.")
+		return fmt.Errorf("SSL.CertFile is not set in the configuration file")
 	}
 	if appConfig.SSL.KeyFile == "" {
-		log.Fatal("SSL.KeyFile is not set in the configuration file.")
+		return fmt.Errorf("SSL.KeyFile is not set in the configuration file")
 	}
 
-	// 4. Compile the regex once at startup
+	// Get or create Jira API token (with caching and validation)
+	log.Println("Getting Jira API token...")
+	token, err := getOrCreateJiraToken(appConfig.Jira.Username, appConfig.Jira.Password, appConfig.Jira.APIURL)
+	if err != nil {
+		return fmt.Errorf("failed to get Jira API token: %w", err)
+	}
+	jiraAPIToken = token
+
+	// Compile the regex once at startup
 	jiraTicketRegex = regexp.MustCompile(`\b([A-Z]+-[0-9]+)\b`)
 
 	log.Println("Service initialized and configuration loaded.")
 	log.Printf("JIRA API URL: %s", appConfig.Jira.APIURL)
+	if len(appConfig.Jira.ProjectsFilter) > 0 {
+		log.Printf("Jira projects filter enabled: %v", appConfig.Jira.ProjectsFilter)
+	} else {
+		log.Println("Jira projects filter disabled - processing all projects")
+	}
 	if appConfig.Gitea.WebhookSecret != "" {
 		log.Println("Gitea webhook secret is configured.")
 	} else {
 		log.Println("WARNING: Gitea webhook secret is NOT configured. Webhook requests will not be verified.")
 	}
 	log.Printf("Listening with TLS. Cert File: %s, Key File: %s", appConfig.SSL.CertFile, appConfig.SSL.KeyFile)
+
+	return nil
+}
+
+// createJiraAPIToken creates a new Personal Access Token using username and password
+func createJiraAPIToken(username, password, apiURL string) (*JiraAPIToken, error) {
+	// Create PAT request payload with 90-day expiration
+	tokenName := fmt.Sprintf("gitea-webhook-%d", time.Now().Unix())
+
+	payload := map[string]any{
+		"name":               tokenName,
+		"expirationDuration": 90,
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling token creation payload: %w", err)
+	}
+
+	// Create the PAT creation request using the correct endpoint
+	tokenURL := fmt.Sprintf("%s/rest/pat/latest/tokens", apiURL)
+	log.Printf("Creating Jira API token with URL: %s", tokenURL)
+	req, err := http.NewRequest(http.MethodPost, tokenURL, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return nil, fmt.Errorf("error creating token request: %w", err)
+	}
+
+	req.SetBasicAuth(username, password)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error sending token creation request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Jira API returned non-success status for token creation: %d - %s", resp.StatusCode, string(respBody))
+	}
+
+	var tokenResponse JiraAPIToken
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResponse); err != nil {
+		return nil, fmt.Errorf("error decoding token response: %w", err)
+	}
+
+	log.Printf("Successfully created Jira Personal Access Token: %s (expires: %s)", tokenResponse.Name, tokenResponse.ExpiringAt)
+	return &tokenResponse, nil
+} // saveTokenToCache saves the API token to local filesystem cache
+func saveTokenToCache(token, username, apiURL, expiryDate string) error {
+	cachedToken := CachedToken{
+		Token:      token,
+		CreatedAt:  time.Now().Format(time.RFC3339),
+		ExpiryDate: expiryDate,
+		Username:   username,
+		APIURL:     apiURL,
+	}
+
+	data, err := json.Marshal(cachedToken)
+	if err != nil {
+		return fmt.Errorf("error marshaling cached token: %w", err)
+	}
+
+	if err := os.WriteFile(defaultTokenCachePath, data, 0600); err != nil {
+		return fmt.Errorf("error writing token cache file: %w", err)
+	}
+
+	log.Printf("Saved API token to cache: %s", defaultTokenCachePath)
+	return nil
+}
+
+// loadTokenFromCache loads the API token from local filesystem cache
+func loadTokenFromCache(username, apiURL string) (string, error) {
+	data, err := os.ReadFile(defaultTokenCachePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("token cache file does not exist")
+		}
+		return "", fmt.Errorf("error reading token cache file: %w", err)
+	}
+
+	var cachedToken CachedToken
+	if err := json.Unmarshal(data, &cachedToken); err != nil {
+		return "", fmt.Errorf("error unmarshaling cached token: %w", err)
+	}
+
+	// Verify the cached token is for the same username and API URL
+	if cachedToken.Username != username || cachedToken.APIURL != apiURL {
+		return "", fmt.Errorf("cached token is for different username or API URL")
+	}
+
+	log.Printf("Loaded API token from cache (created: %s, expires: %s)", cachedToken.CreatedAt, cachedToken.ExpiryDate)
+
+	// Check if token is near expiration
+	if isTokenNearExpiration(cachedToken.ExpiryDate) {
+		return "", fmt.Errorf("cached token is near expiration or expired")
+	}
+
+	return cachedToken.Token, nil
+}
+
+// validateJiraToken tests if the API token is valid by making a simple API call
+func validateJiraToken(token, apiURL string) error {
+	// Test the token by getting API content info
+	testURL := fmt.Sprintf("%s/rest/api/2/mypermissions", apiURL)
+	// log.Printf("Validating token with value: %s", token)
+	log.Printf("Validating token with URL: %s", testURL)
+	req, err := http.NewRequest(http.MethodGet, testURL, nil)
+	if err != nil {
+		return fmt.Errorf("error creating validation request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("error sending validation request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("token is invalid or expired")
+	}
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("validation request failed with status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// log.Printf("API token validation successful - response %s", string(respBody))
+	log.Printf("API token validation successful")
+	return nil
+}
+
+// isTokenNearExpiration checks if a token will expire within the next 7 days
+func isTokenNearExpiration(expiryDateStr string) bool {
+	if expiryDateStr == "" {
+		log.Printf("Warning: Empty expiry date, considering token as expired")
+		return true
+	}
+
+	// Parse the expiry date (Jira returns ISO 8601 format like "2024-12-12T16:19:28.000+0100")
+	expiryDate, err := time.Parse(time.RFC3339, expiryDateStr)
+	if err != nil {
+		// Try alternative format without milliseconds
+		expiryDate, err = time.Parse("2006-01-02T15:04:05Z07:00", expiryDateStr)
+		if err != nil {
+			log.Printf("Warning: Unable to parse expiry date '%s': %v, considering token as expired", expiryDateStr, err)
+			return true
+		}
+	}
+
+	// Check if token expires within the next 7 days
+	sevenDaysFromNow := time.Now().Add(7 * 24 * time.Hour)
+	isNearExpiration := expiryDate.Before(sevenDaysFromNow)
+
+	if isNearExpiration {
+		log.Printf("Token expires on %s, which is within 7 days. Renewal required.", expiryDate.Format(time.RFC3339))
+	} else {
+		log.Printf("Token expires on %s, which is more than 7 days away. No renewal needed.", expiryDate.Format(time.RFC3339))
+	}
+
+	return isNearExpiration
+}
+
+// getOrCreateJiraToken attempts to load a cached token, validates it, and creates a new one if needed
+func getOrCreateJiraToken(username, password, apiURL string) (string, error) {
+	// Try to load cached token first
+	if cachedToken, err := loadTokenFromCache(username, apiURL); err == nil {
+		log.Println("Testing cached API token...")
+		if err := validateJiraToken(cachedToken, apiURL); err == nil {
+			log.Println("Cached API token is valid, using it")
+			return cachedToken, nil
+		}
+		log.Printf("Cached API token is invalid: %v", err)
+	} else {
+		log.Printf("No valid cached token found: %v", err)
+	}
+
+	// Create new token
+	log.Println("Creating new Jira API token...")
+	newTokenResponse, err := createJiraAPIToken(username, password, apiURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to create new API token: %w", err)
+	}
+
+	// Validate the new token
+	log.Println("Validating new API token...")
+	if err := validateJiraToken(newTokenResponse.RawToken, apiURL); err != nil {
+		return "", fmt.Errorf("new API token validation failed: %w", err)
+	}
+
+	// Save the new token to cache with actual expiry date
+	if err := saveTokenToCache(newTokenResponse.RawToken, username, apiURL, newTokenResponse.ExpiringAt); err != nil {
+		log.Printf("Warning: failed to save token to cache: %v", err)
+	}
+
+	return newTokenResponse.RawToken, nil
+}
+
+// refreshJiraToken refreshes the global jiraAPIToken and returns the new token
+func refreshJiraToken() error {
+	log.Println("Refreshing Jira API token...")
+	newToken, err := getOrCreateJiraToken(appConfig.Jira.Username, appConfig.Jira.Password, appConfig.Jira.APIURL)
+	if err != nil {
+		return fmt.Errorf("failed to refresh Jira API token: %w", err)
+	}
+
+	jiraAPIToken = newToken
+	log.Println("Jira API token refreshed successfully")
+	return nil
+}
+
+// startPeriodicTokenRenewal starts a background goroutine that checks for token expiration every hour
+func startPeriodicTokenRenewal() {
+	go func() {
+		log.Println("Starting periodic token renewal checker (every 1 hour)")
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			log.Println("Performing periodic token expiration check...")
+
+			// Try to load the current cached token to check its expiration
+			data, err := os.ReadFile(defaultTokenCachePath)
+			if err != nil {
+				log.Printf("Warning: Could not read token cache for periodic check: %v", err)
+				continue
+			}
+
+			var cachedToken CachedToken
+			if err := json.Unmarshal(data, &cachedToken); err != nil {
+				log.Printf("Warning: Could not parse cached token for periodic check: %v", err)
+				continue
+			}
+
+			// Verify the cached token is for the current configuration
+			if cachedToken.Username != appConfig.Jira.Username || cachedToken.APIURL != appConfig.Jira.APIURL {
+				log.Printf("Warning: Cached token is for different configuration, skipping periodic check")
+				continue
+			}
+
+			// Check if token needs renewal
+			if isTokenNearExpiration(cachedToken.ExpiryDate) {
+				log.Println("Periodic check: Token is near expiration, initiating renewal...")
+				if err := refreshJiraToken(); err != nil {
+					log.Printf("Error during periodic token renewal: %v", err)
+				} else {
+					log.Println("Periodic token renewal completed successfully")
+				}
+			} else {
+				log.Println("Periodic check: Token is still valid, no renewal needed")
+			}
+		}
+	}()
 }
 
 // GiteaWebhookPayload represents the structure of a Gitea push event webhook
@@ -106,47 +429,46 @@ type GiteaWebhookPayload struct {
 		Message string `json:"message"`
 		URL     string `json:"url"` // This is the Gitea commit web link
 		Author  struct {
-			Name  string `json:"name"`
-			Email string `json:"email"`
+			Name     string `json:"name"`
+			Email    string `json:"email"`
+			Username string `json:"username"`
 		} `json:"author"`
+		Committer struct {
+			Name     string `json:"name"`
+			Email    string `json:"email"`
+			Username string `json:"username"`
+		} `json:"committer"`
+		Timestamp string `json:"timestamp"`
 	} `json:"commits"`
 	Repository struct {
-		Name        string `json:"name"`
-		FullName    string `json:"full_name"`
-		HTMLURL     string `json:"html_url"`
+		ID       int    `json:"id"`
+		Name     string `json:"name"`
+		FullName string `json:"full_name"`
+		HTMLURL  string `json:"html_url"`
+		Owner    struct {
+			ID       int    `json:"id"`
+			Login    string `json:"login"`
+			FullName string `json:"full_name"`
+			Email    string `json:"email"`
+			HTMLURL  string `json:"html_url"`
+		} `json:"owner"`
 		Description string `json:"description"`
+		Private     bool   `json:"private"`
 	} `json:"repository"`
 	Pusher struct {
-		Name  string `json:"name"`
-		Email string `json:"email"`
+		ID       int    `json:"id"`
+		Login    string `json:"login"`
+		FullName string `json:"full_name"`
+		Email    string `json:"email"`
+		HTMLURL  string `json:"html_url"`
 	} `json:"pusher"`
 	Sender struct {
-		ID        int    `json:"id"`
-		Login     string `json:"login"`
-		HTMLURL   string `json:"html_url"`
-		AvatarURL string `json:"avatar_url"`
+		ID       int    `json:"id"`
+		Login    string `json:"login"`
+		FullName string `json:"full_name"`
+		Email    string `json:"email"`
+		HTMLURL  string `json:"html_url"`
 	} `json:"sender"`
-}
-
-// JiraCommentBody represents the structure for adding a comment to Jira
-type JiraCommentBody struct {
-	Body struct {
-		Type    string `json:"type"`
-		Version int    `json:"version"`
-		Content []struct {
-			Type    string `json:"type"`
-			Content []struct {
-				Type  string `json:"type"`
-				Text  string `json:"text"`
-				Marks []struct {
-					Type  string `json:"type"`
-					Attrs struct {
-						Href string `json:"href"`
-					} `json:"attrs,omitempty"`
-				} `json:"marks,omitempty"`
-			} `json:"content"`
-		} `json:"content"`
-	} `json:"body"`
 }
 
 // verifyGiteaSignature verifies the HMAC signature of the Gitea webhook payload.
@@ -168,8 +490,38 @@ func verifyGiteaSignature(payload []byte, secret, signature string) bool {
 	return hmac.Equal(decodedSignature, expectedMAC)
 }
 
+// isTicketAllowed checks if a Jira ticket is in the allowed projects list
+func isTicketAllowed(ticketID string) bool {
+	// If no filter is configured, allow all tickets
+	if len(appConfig.Jira.ProjectsFilter) == 0 {
+		return true
+	}
+
+	// Extract project code from ticket ID (e.g., "ITOINFRA-7456" -> "ITOINFRA")
+	parts := strings.SplitN(ticketID, "-", 2)
+	if len(parts) < 2 {
+		log.Printf("Invalid ticket format: %s", ticketID)
+		return false
+	}
+
+	projectCode := parts[0]
+
+	// Check if project is in the allowed list
+	for _, allowedProject := range appConfig.Jira.ProjectsFilter {
+		if strings.EqualFold(projectCode, allowedProject) {
+			return true
+		}
+	}
+
+	log.Printf("Ticket %s project '%s' is not in allowed projects filter: %v", ticketID, projectCode, appConfig.Jira.ProjectsFilter)
+	return false
+}
+
 // giteaWebhookHandler handles incoming Gitea webhook POST requests
 func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Received %s request to %s", r.Method, r.URL.Path)
+	log.Printf("Headers: %v", r.Header)
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST requests are accepted", http.StatusMethodNotAllowed)
 		return
@@ -182,6 +534,8 @@ func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
+
+	log.Printf("Received webhook payload (first 500 chars): %s", string(body)[:min(500, len(body))])
 
 	giteaSignature := r.Header.Get("X-Gitea-Signature")
 	if appConfig.Gitea.WebhookSecret != "" { // Use appConfig.Gitea.WebhookSecret
@@ -217,10 +571,14 @@ func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Received push event for repository: %s (ref: %s)", payload.Repository.FullName, payload.Ref)
 
+	// Collect commits by ticket ID to bundle multiple commits for the same ticket
+	ticketCommits := make(map[string]*TicketCommits)
+
 	for _, commit := range payload.Commits {
 		commitID := commit.ID
 		commitMessage := commit.Message
 		commitURL := commit.URL
+		commitTimestamp := commit.Timestamp
 		repoURL := payload.Repository.HTMLURL
 		repoName := payload.Repository.Name
 
@@ -231,20 +589,47 @@ func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 			uniqueTickets := make(map[string]struct{})
 			for _, match := range foundJiraTickets {
 				if len(match) > 1 {
-					uniqueTickets[match[1]] = struct{}{}
+					ticketID := match[1]
+					// Check if ticket is in allowed projects
+					if isTicketAllowed(ticketID) {
+						uniqueTickets[ticketID] = struct{}{}
+					}
 				}
 			}
 
+			// Add this commit to each unique ticket it references
 			for ticketID := range uniqueTickets {
-				log.Printf("Found Jira ticket '%s' in commit %s. Attempting to update Jira.", ticketID, commitID[:7])
-				if err := addCommitLinkToJira(ticketID, commitURL, commitMessage, commitID, repoURL, repoName); err != nil {
-					log.Printf("Failed to update Jira ticket %s: %v", ticketID, err)
-				} else {
-					log.Printf("Successfully updated Jira ticket %s with commit %s.", ticketID, commitID[:7])
+				if ticketCommits[ticketID] == nil {
+					ticketCommits[ticketID] = &TicketCommits{
+						TicketID: ticketID,
+						Commits:  []CommitInfo{},
+						RepoURL:  repoURL,
+						RepoName: repoName,
+					}
 				}
+
+				commitInfo := CommitInfo{
+					ID:        commitID,
+					Message:   commitMessage,
+					URL:       commitURL,
+					ShortID:   commitID[:7],
+					Timestamp: commitTimestamp,
+				}
+				ticketCommits[ticketID].Commits = append(ticketCommits[ticketID].Commits, commitInfo)
+				log.Printf("Found Jira ticket '%s' in commit %s. Added to bundle.", ticketID, commitID[:7])
 			}
 		} else {
 			log.Printf("No Jira tickets found in commit %s.", commitID[:7])
+		}
+	}
+
+	// Now process each ticket with all its associated commits
+	for ticketID, ticketData := range ticketCommits {
+		log.Printf("Processing ticket %s with %d commit(s)", ticketID, len(ticketData.Commits))
+		if err := addCommitLinkToJira(ticketData); err != nil {
+			log.Printf("Failed to update Jira ticket %s: %v", ticketID, err)
+		} else {
+			log.Printf("Successfully updated Jira ticket %s with %d commit(s).", ticketID, len(ticketData.Commits))
 		}
 	}
 
@@ -252,105 +637,86 @@ func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "Webhook processed successfully")
 }
 
-// addCommitLinkToJira adds a comment to the specified Jira ticket with a link to the Gitea commit
-func addCommitLinkToJira(jiraTicketID, commitURL, commitMessage, commitID, repoURL, repoName string) error {
-	jiraIssueURL := fmt.Sprintf("%s/issue/%s/comment", appConfig.Jira.APIURL, jiraTicketID) // Use appConfig.Jira.APIURL
-
-	displayMessage := strings.SplitN(commitMessage, "\n", 2)[0]
-	if len(displayMessage) > 100 {
-		displayMessage = displayMessage[:100] + "..."
+// formatCommitTimestamp formats a timestamp for display in Jira comments
+func formatCommitTimestamp(timestamp string) string {
+	if timestamp == "" {
+		return "Unknown time"
 	}
 
-	commentBody := JiraCommentBody{
-		Body: struct {
-			Type    string `json:"type"`
-			Version int    `json:"version"`
-			Content []struct {
-				Type    string `json:"type"`
-				Content []struct {
-					Type  string `json:"type"`
-					Text  string `json:"text"`
-					Marks []struct {
-						Type  string `json:"type"`
-						Attrs struct {
-							Href string `json:"href"`
-						} `json:"attrs,omitempty"`
-					} `json:"marks,omitempty"`
-				} `json:"content"`
-			} `json:"content"`
-		}{
-			Type:    "doc",
-			Version: 1,
-			Content: []struct {
-				Type    string `json:"type"`
-				Content []struct {
-					Type  string `json:"type"`
-					Text  string `json:"text"`
-					Marks []struct {
-						Type  string `json:"type"`
-						Attrs struct {
-							Href string `json:"href"`
-						} `json:"attrs,omitempty"`
-					} `json:"marks,omitempty"`
-				} `json:"content"`
-			}{
-				{
-					Type: "paragraph",
-					Content: []struct {
-						Type  string `json:"type"`
-						Text  string `json:"text"`
-						Marks []struct {
-							Type  string `json:"type"`
-							Attrs struct {
-								Href string `json:"href"`
-							} `json:"attrs,omitempty"`
-						} `json:"marks,omitempty"`
-					}{
-						{
-							Type: "text",
-							Text: "Associated Gitea Commit: ",
-						},
-						{
-							Type: "text",
-							Text: fmt.Sprintf("%s (%s)", displayMessage, commitID[:7]),
-							Marks: []struct {
-								Type  string `json:"type"`
-								Attrs struct {
-									Href string `json:"href"`
-								} `json:"attrs,omitempty"`
-							}{
-								{
-									Type: "link",
-									Attrs: struct {
-										Href string `json:"href"`
-									}{Href: commitURL},
-								},
-							},
-						},
-						{
-							Type: "text",
-							Text: " in repository ",
-						},
-						{
-							Type: "text",
-							Text: repoName,
-							Marks: []struct {
-								Type  string `json:"type"`
-								Attrs struct {
-									Href string `json:"href"`
-								} `json:"attrs,omitempty"`
-							}{
-								{
-									Type: "link",
-									Attrs: struct {
-										Href string `json:"href"`
-									}{Href: repoURL},
-								},
-							},
-						},
-					},
-				},
-			},
+	// Parse the timestamp (Gitea provides ISO 8601 format)
+	t, err := time.Parse(time.RFC3339, timestamp)
+	if err != nil {
+		// If parsing fails, return the original timestamp
+		return timestamp
+	}
+
+	// Format as a human-readable date and time
+	return t.Format("2006-01-02 15:04:05 MST")
+}
+
+// addCommitLinkToJira adds a comment to the specified Jira ticket with bundled commits
+func addCommitLinkToJira(ticketData *TicketCommits) error {
+	jiraIssueURL := fmt.Sprintf("%s/rest/api/2/issue/%s/comment", appConfig.Jira.APIURL, ticketData.TicketID)
+	log.Printf("Adding comment to Jira issue URL: %s", jiraIssueURL)
+
+	// Sort commits by timestamp (oldest first)
+	sort.Slice(ticketData.Commits, func(i, j int) bool {
+		// Parse timestamps and compare (Gitea provides ISO 8601 format)
+		timeI, errI := time.Parse(time.RFC3339, ticketData.Commits[i].Timestamp)
+		timeJ, errJ := time.Parse(time.RFC3339, ticketData.Commits[j].Timestamp)
+
+		// If parsing fails, fall back to string comparison
+		if errI != nil || errJ != nil {
+			return ticketData.Commits[i].Timestamp < ticketData.Commits[j].Timestamp
+		}
+
+		return timeI.Before(timeJ)
+	})
+
+	// Build comment text with all commits bundled together
+	var commentLines []string
+
+	if len(ticketData.Commits) == 1 {
+		// Single commit format (maintain compatibility)
+		commit := ticketData.Commits[0]
+		displayMessage := strings.SplitN(commit.Message, "\n", 2)[0]
+		if len(displayMessage) > 100 {
+			displayMessage = displayMessage[:100] + "..."
+		}
+		formattedTime := formatCommitTimestamp(commit.Timestamp)
+		commentLines = append(commentLines, fmt.Sprintf("Associated Gitea Commit: %s (%s)", displayMessage, commit.ShortID))
+		commentLines = append(commentLines, fmt.Sprintf("Commit URL: %s", commit.URL))
+		commentLines = append(commentLines, fmt.Sprintf("Commit Date: %s", formattedTime))
+		commentLines = append(commentLines, fmt.Sprintf("Repository: %s (%s)", ticketData.RepoName, ticketData.RepoURL))
+	} else {
+		// Multiple commits format
+		commentLines = append(commentLines, fmt.Sprintf("Associated Gitea Commits (%d commits):", len(ticketData.Commits)))
+		commentLines = append(commentLines, fmt.Sprintf("Repository: %s (%s)", ticketData.RepoName, ticketData.RepoURL))
+		commentLines = append(commentLines, "")
+
+		for i, commit := range ticketData.Commits {
+			displayMessage := strings.SplitN(commit.Message, "\n", 2)[0]
+			if len(displayMessage) > 80 {
+				displayMessage = displayMessage[:80] + "..."
+			}
+			formattedTime := formatCommitTimestamp(commit.Timestamp)
+			commentLines = append(commentLines, fmt.Sprintf("%d. %s (%s)", i+1, displayMessage, commit.ShortID))
+			commentLines = append(commentLines, fmt.Sprintf("   %s", commit.URL))
+			commentLines = append(commentLines, fmt.Sprintf("   %s", formattedTime))
+			if i < len(ticketData.Commits)-1 {
+				commentLines = append(commentLines, "")
+			}
+		}
+	}
+
+	commentText := strings.Join(commentLines, "\n")
+
+	// Create simple API v2 request body
+	commentBody := map[string]interface{}{
+		"body": commentText,
+		"visibility": map[string]interface{}{
+			"type":  "role",
+			"value": "Members",
 		},
 	}
 
@@ -364,7 +730,7 @@ func addCommitLinkToJira(jiraTicketID, commitURL, commitMessage, commitID, repoU
 		return fmt.Errorf("error creating Jira API request: %w", err)
 	}
 
-	req.SetBasicAuth(appConfig.Jira.Username, appConfig.Jira.APIToken) // Use appConfig.Jira.Username, appConfig.Jira.APIToken
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", jiraAPIToken))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
@@ -375,10 +741,40 @@ func addCommitLinkToJira(jiraTicketID, commitURL, commitMessage, commitID, repoU
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
+
+	// Check for authorization failure and attempt token renewal
+	if resp.StatusCode == http.StatusUnauthorized {
+		log.Printf("Jira API returned 401 Unauthorized. Attempting to refresh token and retry...")
+
+		// Refresh the token
+		if err := refreshJiraToken(); err != nil {
+			return fmt.Errorf("token refresh failed after 401 error: %w", err)
+		}
+
+		// Retry the request with the new token
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", jiraAPIToken))
+		resp2, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("error sending retry request to Jira API: %w", err)
+		}
+		defer resp2.Body.Close()
+
+		respBody2, _ := io.ReadAll(resp2.Body)
+		if resp2.StatusCode != http.StatusCreated && resp2.StatusCode != http.StatusOK {
+			return fmt.Errorf("Jira API retry returned non-success status: %d - %s", resp2.StatusCode, string(respBody2))
+		}
+
+		log.Printf("Received successfully response from Jira API for ticket %s after token refresh - %s", ticketData.TicketID, string(respBody2))
+		return nil
+	}
+
+	// Handle other non-success status codes
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("Jira API returned non-success status: %d - %s", resp.StatusCode, string(respBody))
 	}
+
+	log.Printf("Received successfully response from Jira API for ticket %s - %s", ticketData.TicketID, string(respBody))
 
 	return nil
 }
@@ -412,11 +808,25 @@ func main() {
 		return
 	}
 
-	// Override config path if provided via command line
-	if *configFlag != defaultConfigPath {
-		configPath = *configFlag
+	// Determine config path from command line or environment variable
+	configPath := *configFlag
+	if envConfigPath := os.Getenv("CONFIG_FILE_PATH"); envConfigPath != "" {
+		configPath = envConfigPath
+		log.Printf("Using configuration file from CONFIG_FILE_PATH environment variable: %s", configPath)
+	} else {
+		log.Printf("Using configuration file: %s", configPath)
 	}
 
+	// Load and validate configuration
+	if err := loadConfiguration(configPath); err != nil {
+		log.Fatalf("Configuration error: %v", err)
+	}
+
+	// Start periodic token renewal checker
+	startPeriodicTokenRenewal()
+
+	// Register webhook handlers for both root path and /gitea-webhook
+	http.HandleFunc("/", giteaWebhookHandler)
 	http.HandleFunc("/gitea-webhook", giteaWebhookHandler)
 
 	// Use port from config, or default to 8443 if not set
