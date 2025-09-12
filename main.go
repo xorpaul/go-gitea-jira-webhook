@@ -50,10 +50,11 @@ var defaultTokenCachePath = func() string {
 // Config represents the structure of our TOML configuration file
 type Config struct {
 	Jira struct {
-		APIURL         string   `toml:"api_url"`
-		Username       string   `toml:"username"`
-		Password       string   `toml:"password"`
-		ProjectsFilter []string `toml:"projects_filter"` // Optional: only process tickets from these projects
+		APIURL            string   `toml:"api_url"`
+		Username          string   `toml:"username"`
+		Password          string   `toml:"password"`
+		ProjectsFilter    []string `toml:"projects_filter"`    // Optional: only process tickets from these projects
+		CommentVisibility string   `toml:"comment_visibility"` // Optional: e.g. "role:Members" or empty for none
 	} `toml:"jira"`
 	Gitea struct {
 		WebhookSecret string `toml:"webhook_secret"` // Optional
@@ -709,15 +710,26 @@ func addCommitLinkToJira(ticketData *TicketCommits) error {
 		}
 	}
 
+	// Add footer with link to the project
+	commentLines = append(commentLines, "")
+	commentLines = append(commentLines, "{color:#707070}created via [go-gitea-jira-webhook|https://github.com/xorpaul/go-gitea-jira-webhook]{color}")
+
 	commentText := strings.Join(commentLines, "\n")
 
 	// Create simple API v2 request body
 	commentBody := map[string]interface{}{
 		"body": commentText,
-		"visibility": map[string]interface{}{
-			"type":  "role",
-			"value": "Members",
-		},
+	}
+	// Add visibility if configured
+	if appConfig.Jira.CommentVisibility != "" {
+		// Format: "role:Members" or "group:SomeGroup"
+		parts := strings.SplitN(appConfig.Jira.CommentVisibility, ":", 2)
+		if len(parts) == 2 {
+			commentBody["visibility"] = map[string]interface{}{
+				"type":  parts[0],
+				"value": parts[1],
+			}
+		}
 	}
 
 	jsonBody, err := json.Marshal(commentBody)
