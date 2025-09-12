@@ -2,6 +2,8 @@
 
 A Go application that receives webhooks from Gitea and automatically adds comments to Jira tickets when commits reference ticket IDs.
 
+![go-gitea-jira-webhook.jpg](go-gitea-jira-webhook.jpg)
+
 ## Features
 
 - Receives Gitea push webhooks
