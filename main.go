@@ -551,13 +551,136 @@ func isTicketAllowed(ticketID string) bool {
 	return false
 }
 
+// serviceOverviewHandler handles GET requests to show service configuration overview
+func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Only GET requests are accepted for overview", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	// Build overview information
+	var bufferStatus string
+	if appConfig.Buffering.Duration != "" {
+		bufferStatus = fmt.Sprintf("Enabled (%s)", appConfig.Buffering.Duration)
+	} else {
+		bufferStatus = "Disabled"
+	}
+
+	var projectFilter string
+	if len(appConfig.Jira.ProjectsFilter) > 0 {
+		projectFilter = strings.Join(appConfig.Jira.ProjectsFilter, ", ")
+	} else {
+		projectFilter = "All projects (no filter)"
+	}
+
+	var visibilitySettings string
+	if appConfig.Jira.CommentVisibility != "" {
+		visibilitySettings = appConfig.Jira.CommentVisibility
+	} else {
+		visibilitySettings = "Public (no visibility restrictions)"
+	}
+
+	var webhookSecurity string
+	if appConfig.Gitea.WebhookSecret != "" {
+		webhookSecurity = "Enabled (HMAC signature verification)"
+	} else {
+		webhookSecurity = "Disabled (no signature verification)"
+	}
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+    <title>Go Gitea Jira Webhook - Service Overview</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; border-bottom: 2px solid #007acc; padding-bottom: 10px; }
+        h2 { color: #555; margin-top: 30px; }
+        .status { background: #e8f5e8; padding: 15px; border-radius: 5px; margin: 10px 0; }
+        .feature { background: #f0f8ff; padding: 12px; border-left: 4px solid #007acc; margin: 8px 0; }
+        .warning { background: #fff3cd; padding: 12px; border-left: 4px solid #ffc107; margin: 8px 0; }
+        table { width: 100%%; border-collapse: collapse; margin: 15px 0; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #f8f9fa; font-weight: bold; }
+        .endpoint { font-family: monospace; background: #f8f9fa; padding: 2px 6px; border-radius: 3px; }
+        .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; color: #666; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔗 Go Gitea Jira Webhook Service</h1>
+        
+        <div class="status">
+            <strong>Service Status:</strong> Running ✅<br>
+            <strong>Build Version:</strong> %s<br>
+            <strong>Build Time:</strong> %s
+        </div>
+
+        <h2>📋 Configuration Overview</h2>
+        <table>
+            <tr><th>Setting</th><th>Value</th></tr>
+            <tr><td>Jira API URL</td><td>%s</td></tr>
+            <tr><td>Jira Username</td><td>%s</td></tr>
+            <tr><td>Project Filter</td><td>%s</td></tr>
+            <tr><td>Comment Visibility</td><td>%s</td></tr>
+            <tr><td>Commit Buffering</td><td>%s</td></tr>
+            <tr><td>Webhook Security</td><td>%s</td></tr>
+        </table>
+
+        <h2>🎯 Special Features</h2>
+        <div class="feature">
+            <strong>💬 Public Comment Override:</strong> Use <code>$TICKETID</code> format in commit messages (e.g., <code>$PROJ-123</code>) to force public visibility, bypassing the comment_visibility setting.
+        </div>
+        <div class="feature">
+            <strong>📦 Commit Bundling:</strong> Multiple commits referencing the same ticket are automatically bundled into a single comment.
+        </div>
+        <div class="feature">
+            <strong>🔄 Token Management:</strong> Automatic Jira API token creation, caching, and renewal with 90-day expiry.
+        </div>
+        <div class="feature">
+            <strong>🛡️ Security:</strong> HTTPS/TLS required, optional HMAC signature verification for webhooks.
+        </div>
+
+        <h2>🌐 API Endpoints</h2>
+        <table>
+            <tr><th>Method</th><th>Endpoint</th><th>Purpose</th></tr>
+            <tr><td>GET</td><td class="endpoint">/</td><td>Service overview (this page)</td></tr>
+            <tr><td>POST</td><td class="endpoint">/</td><td>Gitea webhook receiver</td></tr>
+            <tr><td>POST</td><td class="endpoint">/gitea-webhook</td><td>Gitea webhook receiver (alternative)</td></tr>
+        </table>
+
+        <h2>📝 Usage Instructions</h2>
+        <div class="feature">
+            <strong>Webhook Configuration:</strong> Point your Gitea repository webhook to:<br>
+            <code>https://your-server:%s/gitea-webhook</code>
+        </div>
+        <div class="feature">
+            <strong>Commit Message Format:</strong><br>
+            • Normal: <code>Fix bug for PROJ-123</code> (uses configured visibility)<br>
+            • Public: <code>Fix bug for $PROJ-123</code> (forces public visibility)
+        </div>
+
+        <div class="footer">
+            <p>🚀 <strong>Go Gitea Jira Webhook</strong> - Automatically sync Gitea commits to Jira tickets</p>
+            <p>📖 <a href="https://github.com/xorpaul/go-gitea-jira-webhook" target="_blank">Documentation & Source Code</a></p>
+        </div>
+    </div>
+</body>
+</html>`, buildversion, buildtime, appConfig.Jira.APIURL, appConfig.Jira.Username, projectFilter, visibilitySettings, bufferStatus, webhookSecurity, appConfig.Server.Port)
+
+	fmt.Fprint(w, html)
+	log.Printf("Served service overview to %s", r.RemoteAddr)
+}
+
 // giteaWebhookHandler handles incoming Gitea webhook POST requests
 func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Received %s request to %s", r.Method, r.URL.Path)
 	log.Printf("Headers: %v", r.Header)
 
 	if r.Method != http.MethodPost {
-		http.Error(w, "Only POST requests are accepted", http.StatusMethodNotAllowed)
+		http.Error(w, "Only POST requests are accepted for webhooks", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -986,8 +1109,18 @@ func main() {
 	// Start periodic token renewal checker
 	startPeriodicTokenRenewal()
 
-	// Register webhook handlers for both root path and /gitea-webhook
-	http.HandleFunc("/", giteaWebhookHandler)
+	// Combined handler for root path - GET for overview, POST for webhooks
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			serviceOverviewHandler(w, r)
+		} else if r.Method == http.MethodPost {
+			giteaWebhookHandler(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	// Dedicated webhook handler
 	http.HandleFunc("/gitea-webhook", giteaWebhookHandler)
 
 	// Use port from config, or default to 8443 if not set

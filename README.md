@@ -11,6 +11,7 @@ A Go application that receives webhooks from Gitea and automatically adds commen
 - **Public Comment Override**: Use `$TICKETID` format to force public visibility
 - Automatically adds comments to Jira tickets with commit links
 - **Commit Buffering**: Optional buffering to reduce comment spam by batching commits over a configurable time period
+- **Service Overview**: Web-based configuration overview available via HTTP GET to root path
 - Supports HMAC signature verification for webhook security
 - Configurable via TOML configuration file
 - HTTPS/TLS support
@@ -183,6 +184,21 @@ Examples:
    ./go-gitea-jira-webhook
    ```
 4. Configure your Gitea repository webhook to point to: `https://your-server:8443/gitea-webhook`
+5. Access the service overview at: `https://your-server:8443/` (GET request)
+
+### Service Overview
+
+The service provides a web-based configuration overview accessible via HTTP GET request to the root path (`/`). This overview displays:
+
+- **Service Status**: Current build version and build time
+- **Configuration Settings**: Jira URL, username, project filters, comment visibility settings
+- **Buffering Status**: Whether commit buffering is enabled and the configured duration
+- **Security Settings**: Webhook signature verification status
+- **Special Features**: Documentation of $TICKETID override and other features
+- **API Endpoints**: Available HTTP endpoints and their purposes
+- **Usage Instructions**: How to configure webhooks and format commit messages
+
+Simply navigate to `https://your-server:8443/` in a web browser to view the current service configuration and status.
 
 ## How It Works
 
