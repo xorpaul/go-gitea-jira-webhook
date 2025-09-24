@@ -7,7 +7,8 @@ A Go application that receives webhooks from Gitea and automatically adds commen
 ## Features
 
 - Receives Gitea push webhooks
-- Extracts Jira ticket IDs from commit messages using regex pattern `\b([A-Z]+-[0-9]+)\b`
+- Extracts Jira ticket IDs from commit messages using regex pattern `\b(\$?[A-Z]+-[0-9]+)\b`
+- **Public Comment Override**: Use `$TICKETID` format to force public visibility
 - Automatically adds comments to Jira tickets with commit links
 - **Commit Buffering**: Optional buffering to reduce comment spam by batching commits over a configurable time period
 - Supports HMAC signature verification for webhook security
@@ -53,6 +54,8 @@ duration = "10m"   # Optional: buffer duration (e.g., "5s", "10m", "1h") - if se
 - **password**: Your Jira password (used to create API tokens automatically)
 - **projects_filter**: (Optional) Array of Jira project codes to process. If empty or omitted, all projects will be processed.
 - **comment_visibility**: (Optional) Set comment visibility. Format: "type:value" (e.g., "role:Members", "group:developers"). If empty, comments will be public.
+
+**Public Comment Override**: Use `$TICKETID` format in commit messages (e.g., `$PROJ-123`) to force public visibility, bypassing the `comment_visibility` setting for that specific ticket.
 
 #### Buffering Section
 
@@ -187,10 +190,33 @@ Examples:
 2. The application verifies the webhook signature (if configured)
 3. Extracts commit messages from the push event
 4. Searches for Jira ticket IDs in commit messages using regex
-5. Bundles multiple commits referencing the same ticket ID together
-6. For each ticket ID, adds a single comment to the Jira ticket with:
+5. Checks for public visibility override (`$TICKETID` format)
+6. Bundles multiple commits referencing the same ticket ID together
+7. For each ticket ID, adds a single comment to the Jira ticket with:
    - **Single commit**: Link to the commit, commit message (truncated if too long), repository information
    - **Multiple commits**: List of all commits with links, commit messages, and repository information
+
+### Public Visibility Override
+
+You can force a comment to be public (bypassing the `comment_visibility` setting) by using the `$TICKETID` format in your commit messages:
+
+- **Normal format**: `PROJ-123` - Uses configured visibility settings
+- **Public format**: `$PROJ-123` - Forces comment to be public
+
+Examples:
+
+```bash
+# This commit will use configured visibility (e.g., role:Members)
+git commit -m "Fix login bug for PROJ-123"
+
+# This commit will force public visibility, ignoring comment_visibility setting
+git commit -m "Fix login bug for $PROJ-123"
+
+# Mixed usage - the entire ticket comment will be public if ANY commit uses $
+git commit -m "Fix login bug for PROJ-123 and $PROJ-456"
+```
+
+**Note**: If any commit referencing a ticket uses the `$` prefix, the entire bundled comment for that ticket will be public.
 
 ### Commit Bundling
 

@@ -104,10 +104,11 @@ type CommitInfo struct {
 
 // TicketCommits represents all commits associated with a specific Jira ticket
 type TicketCommits struct {
-	TicketID string
-	Commits  []CommitInfo
-	RepoURL  string
-	RepoName string
+	TicketID    string
+	Commits     []CommitInfo
+	RepoURL     string
+	RepoName    string
+	ForcePublic bool // True if any commit used $TICKETID format to force public visibility
 }
 
 // BufferedTicket represents a ticket with buffered commits and timer
@@ -161,8 +162,8 @@ func loadConfiguration(configPath string) error {
 	}
 	jiraAPIToken = token
 
-	// Compile the regex once at startup
-	jiraTicketRegex = regexp.MustCompile(`\b([A-Z]+-[0-9]+)\b`)
+	// Compile the regex once at startup - captures both $TICKETID (public) and TICKETID (normal) formats
+	jiraTicketRegex = regexp.MustCompile(`\b(\$?[A-Z]+-[0-9]+)\b`)
 
 	log.Println("Service initialized and configuration loaded.")
 	log.Printf("JIRA API URL: %s", appConfig.Jira.APIURL)
@@ -619,26 +620,48 @@ func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 
 		foundJiraTickets := jiraTicketRegex.FindAllStringSubmatch(commitMessage, -1)
 		if len(foundJiraTickets) > 0 {
-			uniqueTickets := make(map[string]struct{})
+			uniqueTickets := make(map[string]bool) // bool indicates if ticket should be public
 			for _, match := range foundJiraTickets {
 				if len(match) > 1 {
-					ticketID := match[1]
+					rawTicketID := match[1]
+					var ticketID string
+					var forcePublic bool
+
+					// Check if ticket has $ prefix for public visibility
+					if strings.HasPrefix(rawTicketID, "$") {
+						ticketID = rawTicketID[1:] // Remove $ prefix
+						forcePublic = true
+						log.Printf("Found public ticket reference: %s (will bypass visibility settings)", rawTicketID)
+					} else {
+						ticketID = rawTicketID
+						forcePublic = false
+					}
+
 					// Check if ticket is in allowed projects
 					if isTicketAllowed(ticketID) {
-						uniqueTickets[ticketID] = struct{}{}
+						// If ticket already seen, preserve public flag if any reference was public
+						if existing, exists := uniqueTickets[ticketID]; exists {
+							uniqueTickets[ticketID] = existing || forcePublic
+						} else {
+							uniqueTickets[ticketID] = forcePublic
+						}
 					}
 				}
 			}
 
 			// Add this commit to each unique ticket it references
-			for ticketID := range uniqueTickets {
+			for ticketID, forcePublic := range uniqueTickets {
 				if ticketCommits[ticketID] == nil {
 					ticketCommits[ticketID] = &TicketCommits{
-						TicketID: ticketID,
-						Commits:  []CommitInfo{},
-						RepoURL:  repoURL,
-						RepoName: repoName,
+						TicketID:    ticketID,
+						Commits:     []CommitInfo{},
+						RepoURL:     repoURL,
+						RepoName:    repoName,
+						ForcePublic: forcePublic,
 					}
+				} else {
+					// If any reference was public, mark the whole ticket as public
+					ticketCommits[ticketID].ForcePublic = ticketCommits[ticketID].ForcePublic || forcePublic
 				}
 
 				commitInfo := CommitInfo{
@@ -661,7 +684,7 @@ func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		// Add commits to buffer instead of processing immediately
 		for ticketID, ticketData := range ticketCommits {
 			for _, commit := range ticketData.Commits {
-				addCommitToBuffer(ticketID, commit, ticketData.RepoURL, ticketData.RepoName)
+				addCommitToBuffer(ticketID, commit, ticketData.RepoURL, ticketData.RepoName, ticketData.ForcePublic)
 			}
 		}
 	} else {
@@ -709,7 +732,7 @@ func processBufferedTicket(ticketID string) {
 }
 
 // addCommitToBuffer adds a commit to the buffer for a ticket
-func addCommitToBuffer(ticketID string, commitInfo CommitInfo, repoURL, repoName string) {
+func addCommitToBuffer(ticketID string, commitInfo CommitInfo, repoURL, repoName string, forcePublic bool) {
 	bufferMutex.Lock()
 	defer bufferMutex.Unlock()
 
@@ -718,10 +741,11 @@ func addCommitToBuffer(ticketID string, commitInfo CommitInfo, repoURL, repoName
 		// First commit for this ticket - create new buffer entry
 		bufferedTicket = &BufferedTicket{
 			TicketData: &TicketCommits{
-				TicketID: ticketID,
-				Commits:  []CommitInfo{commitInfo},
-				RepoURL:  repoURL,
-				RepoName: repoName,
+				TicketID:    ticketID,
+				Commits:     []CommitInfo{commitInfo},
+				RepoURL:     repoURL,
+				RepoName:    repoName,
+				ForcePublic: forcePublic,
 			},
 			FirstSeen: time.Now(),
 		}
@@ -736,6 +760,8 @@ func addCommitToBuffer(ticketID string, commitInfo CommitInfo, repoURL, repoName
 	} else {
 		// Add commit to existing buffer
 		bufferedTicket.TicketData.Commits = append(bufferedTicket.TicketData.Commits, commitInfo)
+		// If any commit forces public, mark the whole ticket as public
+		bufferedTicket.TicketData.ForcePublic = bufferedTicket.TicketData.ForcePublic || forcePublic
 		log.Printf("Added commit to buffer for ticket %s (total: %d commits)", ticketID, len(bufferedTicket.TicketData.Commits))
 	}
 }
@@ -839,8 +865,8 @@ func addCommitLinkToJira(ticketData *TicketCommits) error {
 	commentBody := map[string]interface{}{
 		"body": commentText,
 	}
-	// Add visibility if configured
-	if appConfig.Jira.CommentVisibility != "" {
+	// Add visibility if configured and not forced to be public
+	if appConfig.Jira.CommentVisibility != "" && !ticketData.ForcePublic {
 		// Format: "role:Members" or "group:SomeGroup"
 		parts := strings.SplitN(appConfig.Jira.CommentVisibility, ":", 2)
 		if len(parts) == 2 {
@@ -849,6 +875,10 @@ func addCommitLinkToJira(ticketData *TicketCommits) error {
 				"value": parts[1],
 			}
 		}
+	}
+
+	if ticketData.ForcePublic {
+		log.Printf("Comment for ticket %s will be public ($ prefix used)", ticketData.TicketID)
 	}
 
 	jsonBody, err := json.Marshal(commentBody)
