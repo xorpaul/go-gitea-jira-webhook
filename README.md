@@ -9,6 +9,7 @@ A Go application that receives webhooks from Gitea and automatically adds commen
 - Receives Gitea push webhooks
 - Extracts Jira ticket IDs from commit messages using regex pattern `\b([A-Z]+-[0-9]+)\b`
 - Automatically adds comments to Jira tickets with commit links
+- **Commit Buffering**: Optional buffering to reduce comment spam by batching commits over a configurable time period
 - Supports HMAC signature verification for webhook security
 - Configurable via TOML configuration file
 - HTTPS/TLS support
@@ -38,6 +39,9 @@ key_file = "/path/to/key.pem"
 
 [server]
 port = "8443"
+
+[buffering]
+duration = "10m"   # Optional: buffer duration (e.g., "5s", "10m", "1h") - if set, buffering is enabled
 ```
 
 ### Configuration Options
@@ -48,6 +52,20 @@ port = "8443"
 - **username**: Your Jira username
 - **password**: Your Jira password (used to create API tokens automatically)
 - **projects_filter**: (Optional) Array of Jira project codes to process. If empty or omitted, all projects will be processed.
+- **comment_visibility**: (Optional) Set comment visibility. Format: "type:value" (e.g., "role:Members", "group:developers"). If empty, comments will be public.
+
+#### Buffering Section
+
+- **duration**: (Optional) Buffer duration in Go duration format (e.g., "5s", "10m", "1h"). If set, buffering is automatically enabled.
+
+When a duration is configured, the application collects all commits for each Jira ticket over the specified duration before posting a single comment. This prevents comment spam when multiple commits are pushed in quick succession (e.g., during debugging, typo fixes, or rapid development).
+
+**How buffering works:**
+
+1. First commit for a ticket starts the buffer timer
+2. Additional commits for the same ticket are added to the buffer
+3. After the buffer duration expires, all buffered commits are posted as a single comment
+4. On graceful shutdown (SIGINT/SIGTERM), all pending buffered commits are immediately processed
 
 #### Project Filtering Examples
 

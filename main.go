@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,9 +13,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml" // Import the TOML library
@@ -56,6 +60,9 @@ type Config struct {
 		ProjectsFilter    []string `toml:"projects_filter"`    // Optional: only process tickets from these projects
 		CommentVisibility string   `toml:"comment_visibility"` // Optional: e.g. "role:Members" or empty for none
 	} `toml:"jira"`
+	Buffering struct {
+		Duration string `toml:"duration"` // Optional: buffer duration like "10m", "5s", etc. - if set, buffering is enabled
+	} `toml:"buffering"`
 	Gitea struct {
 		WebhookSecret string `toml:"webhook_secret"` // Optional
 	} `toml:"gitea"`
@@ -103,11 +110,23 @@ type TicketCommits struct {
 	RepoName string
 }
 
+// BufferedTicket represents a ticket with buffered commits and timer
+type BufferedTicket struct {
+	TicketData *TicketCommits
+	Timer      *time.Timer
+	FirstSeen  time.Time
+}
+
 // Global variables to hold configuration and compiled regex
 var (
 	appConfig       Config
 	jiraAPIToken    string // Store the generated API token
 	jiraTicketRegex *regexp.Regexp
+
+	// Buffering variables
+	bufferMutex     sync.Mutex
+	bufferedTickets map[string]*BufferedTicket
+	bufferDuration  time.Duration
 )
 
 // loadConfiguration loads and validates the configuration from the specified file
@@ -158,6 +177,19 @@ func loadConfiguration(configPath string) error {
 		log.Println("WARNING: Gitea webhook secret is NOT configured. Webhook requests will not be verified.")
 	}
 	log.Printf("Listening with TLS. Cert File: %s, Key File: %s", appConfig.SSL.CertFile, appConfig.SSL.KeyFile)
+
+	// Initialize buffering if duration is set
+	bufferedTickets = make(map[string]*BufferedTicket)
+	if appConfig.Buffering.Duration != "" {
+		var err error
+		bufferDuration, err = time.ParseDuration(appConfig.Buffering.Duration)
+		if err != nil {
+			return fmt.Errorf("invalid buffering duration '%s': %w", appConfig.Buffering.Duration, err)
+		}
+		log.Printf("Commit buffering enabled with duration: %s", bufferDuration)
+	} else {
+		log.Println("Commit buffering disabled - comments will be posted immediately")
+	}
 
 	return nil
 }
@@ -624,18 +656,105 @@ func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Now process each ticket with all its associated commits
-	for ticketID, ticketData := range ticketCommits {
-		log.Printf("Processing ticket %s with %d commit(s)", ticketID, len(ticketData.Commits))
-		if err := addCommitLinkToJira(ticketData); err != nil {
-			log.Printf("Failed to update Jira ticket %s: %v", ticketID, err)
-		} else {
-			log.Printf("Successfully updated Jira ticket %s with %d commit(s).", ticketID, len(ticketData.Commits))
+	// Process tickets based on buffering configuration
+	if appConfig.Buffering.Duration != "" {
+		// Add commits to buffer instead of processing immediately
+		for ticketID, ticketData := range ticketCommits {
+			for _, commit := range ticketData.Commits {
+				addCommitToBuffer(ticketID, commit, ticketData.RepoURL, ticketData.RepoName)
+			}
+		}
+	} else {
+		// Process each ticket with all its associated commits immediately (legacy behavior)
+		for ticketID, ticketData := range ticketCommits {
+			log.Printf("Processing ticket %s with %d commit(s)", ticketID, len(ticketData.Commits))
+			if err := addCommitLinkToJira(ticketData); err != nil {
+				log.Printf("Failed to update Jira ticket %s: %v", ticketID, err)
+			} else {
+				log.Printf("Successfully updated Jira ticket %s with %d commit(s).", ticketID, len(ticketData.Commits))
+			}
 		}
 	}
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "Webhook processed successfully")
+}
+
+// processBufferedTicket processes a buffered ticket by sending the comment to Jira
+func processBufferedTicket(ticketID string) {
+	bufferMutex.Lock()
+	bufferedTicket, exists := bufferedTickets[ticketID]
+	if !exists {
+		bufferMutex.Unlock()
+		return
+	}
+
+	// Remove from buffer and stop timer
+	delete(bufferedTickets, ticketID)
+	if bufferedTicket.Timer != nil {
+		bufferedTicket.Timer.Stop()
+	}
+
+	ticketData := bufferedTicket.TicketData
+	bufferMutex.Unlock()
+
+	log.Printf("Processing buffered ticket %s with %d commit(s) (buffered for %s)",
+		ticketID, len(ticketData.Commits), time.Since(bufferedTicket.FirstSeen).Round(time.Second))
+
+	if err := addCommitLinkToJira(ticketData); err != nil {
+		log.Printf("Failed to update Jira ticket %s: %v", ticketID, err)
+	} else {
+		log.Printf("Successfully updated Jira ticket %s with %d commit(s).", ticketID, len(ticketData.Commits))
+	}
+}
+
+// addCommitToBuffer adds a commit to the buffer for a ticket
+func addCommitToBuffer(ticketID string, commitInfo CommitInfo, repoURL, repoName string) {
+	bufferMutex.Lock()
+	defer bufferMutex.Unlock()
+
+	bufferedTicket, exists := bufferedTickets[ticketID]
+	if !exists {
+		// First commit for this ticket - create new buffer entry
+		bufferedTicket = &BufferedTicket{
+			TicketData: &TicketCommits{
+				TicketID: ticketID,
+				Commits:  []CommitInfo{commitInfo},
+				RepoURL:  repoURL,
+				RepoName: repoName,
+			},
+			FirstSeen: time.Now(),
+		}
+
+		// Set timer to process after buffer duration
+		bufferedTicket.Timer = time.AfterFunc(bufferDuration, func() {
+			processBufferedTicket(ticketID)
+		})
+
+		bufferedTickets[ticketID] = bufferedTicket
+		log.Printf("Started buffering for ticket %s (will process in %s)", ticketID, bufferDuration)
+	} else {
+		// Add commit to existing buffer
+		bufferedTicket.TicketData.Commits = append(bufferedTicket.TicketData.Commits, commitInfo)
+		log.Printf("Added commit to buffer for ticket %s (total: %d commits)", ticketID, len(bufferedTicket.TicketData.Commits))
+	}
+}
+
+// flushAllBufferedTickets processes all remaining buffered tickets immediately
+func flushAllBufferedTickets() {
+	bufferMutex.Lock()
+	ticketIDs := make([]string, 0, len(bufferedTickets))
+	for ticketID := range bufferedTickets {
+		ticketIDs = append(ticketIDs, ticketID)
+	}
+	bufferMutex.Unlock()
+
+	if len(ticketIDs) > 0 {
+		log.Printf("Flushing %d buffered tickets on shutdown", len(ticketIDs))
+		for _, ticketID := range ticketIDs {
+			processBufferedTicket(ticketID)
+		}
+	}
 }
 
 // formatCommitTimestamp formats a timestamp for display in Jira comments
@@ -852,5 +971,25 @@ func main() {
 	log.Printf("Using certificate file: %s", appConfig.SSL.CertFile)
 	log.Printf("Using key file: %s", appConfig.SSL.KeyFile)
 
-	log.Fatal(http.ListenAndServeTLS(addr, appConfig.SSL.CertFile, appConfig.SSL.KeyFile, nil))
+	// Create server for graceful shutdown
+	server := &http.Server{
+		Addr: addr,
+	}
+
+	// Handle graceful shutdown
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+
+		log.Println("Received shutdown signal, flushing buffered tickets...")
+		flushAllBufferedTickets()
+
+		log.Println("Shutting down server...")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		server.Shutdown(ctx)
+	}()
+
+	log.Fatal(server.ListenAndServeTLS(appConfig.SSL.CertFile, appConfig.SSL.KeyFile))
 }

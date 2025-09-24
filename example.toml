@@ -14,3 +14,6 @@ key_file = "/path/to/key.pem"
 
 [server]
 port = "8443"
+
+[buffering]
+duration = "10m"   # Optional: buffer duration (e.g., "5s", "10m", "1h") - if set, buffering is enabled
