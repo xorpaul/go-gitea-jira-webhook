@@ -15,6 +15,7 @@ key_file = "/path/to/key.pem"
 
 [server]
 port = "8443"
+# allowed_cidrs = ["192.168.1.0/24", "10.0.0.0/8", "172.16.0.0/12"]  # Optional: restrict POST requests to specific IP ranges
 
 [buffering]
 duration = "10m"   # Optional: buffer duration (e.g., "5s", "10m", "1h") - if set, buffering is enabled

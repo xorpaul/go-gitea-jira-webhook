@@ -12,6 +12,7 @@ A Go application that receives webhooks from Gitea and automatically adds commen
 - Automatically adds comments to Jira tickets with commit links
 - **Commit Buffering**: Optional buffering to reduce comment spam by batching commits over a configurable time period
 - **Service Overview**: Web-based configuration overview available via HTTP GET to root path
+- **IP Restrictions**: Optional CIDR-based IP filtering for webhook POST requests
 - Supports HMAC signature verification for webhook security
 - Configurable via TOML configuration file
 - HTTPS/TLS support
@@ -94,6 +95,38 @@ password = "your-jira-password"
 ```
 
 **Note**: The application will automatically create a Jira API token using your username and password at startup. The API token is generated dynamically and used for all subsequent Jira API calls. Tokens are cached locally and automatically renewed when they expire or are near expiration (within 7 days).
+
+#### Server Section
+
+- **port**: Server port number (default: 8443)
+- **allowed_cidrs**: (Optional) Array of CIDR ranges to restrict webhook POST requests. If configured, only requests from these IP ranges will be accepted.
+
+**IP Restriction Examples:**
+
+```toml
+[server]
+port = "8443"
+allowed_cidrs = ["192.168.1.0/24", "10.0.0.0/8"]  # Only allow from private networks
+```
+
+```toml
+[server]
+port = "8443"
+allowed_cidrs = ["203.0.113.0/24"]  # Only allow from specific public subnet
+```
+
+```toml
+[server]
+port = "8443"
+# allowed_cidrs is omitted - all IPs are allowed (default behavior)
+```
+
+**Security Benefits:**
+
+- Prevents unauthorized webhook abuse from unknown sources
+- Restricts access to known Gitea server IP ranges
+- Provides helpful error messages with HTTP 403 Forbidden for blocked IPs
+- Logs all blocked attempts for security monitoring
 
 ### Token Management
 

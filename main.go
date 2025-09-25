@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,6 +25,9 @@ import (
 
 	"github.com/BurntSushi/toml" // Import the TOML library
 )
+
+//go:embed go-gitea-jira-webhook.jpg
+var embeddedImage embed.FS
 
 // min returns the minimum of two integers
 func min(a, b int) int {
@@ -71,7 +76,8 @@ type Config struct {
 		KeyFile  string `toml:"key_file"`
 	} `toml:"ssl"`
 	Server struct {
-		Port string `toml:"port"` // Can also be hardcoded to 8443
+		Port         string   `toml:"port"`          // Can also be hardcoded to 8443
+		AllowedCIDRs []string `toml:"allowed_cidrs"` // Optional: allowed IP ranges for POST requests (e.g., ["192.168.1.0/24", "10.0.0.0/8"])
 	} `toml:"server"`
 }
 
@@ -176,6 +182,11 @@ func loadConfiguration(configPath string) error {
 		log.Println("Gitea webhook secret is configured.")
 	} else {
 		log.Println("WARNING: Gitea webhook secret is NOT configured. Webhook requests will not be verified.")
+	}
+	if len(appConfig.Server.AllowedCIDRs) > 0 {
+		log.Printf("IP restrictions enabled: POST requests allowed only from: %v", appConfig.Server.AllowedCIDRs)
+	} else {
+		log.Println("WARNING: No IP restrictions configured. POST requests accepted from any IP address.")
 	}
 	log.Printf("Listening with TLS. Cert File: %s, Key File: %s", appConfig.SSL.CertFile, appConfig.SSL.KeyFile)
 
@@ -551,6 +562,63 @@ func isTicketAllowed(ticketID string) bool {
 	return false
 }
 
+// isIPAllowed checks if the client IP is in the allowed CIDR ranges
+func isIPAllowed(clientIP string, allowedCIDRs []string) bool {
+	// If no CIDR restrictions are configured, allow all IPs
+	if len(allowedCIDRs) == 0 {
+		return true
+	}
+
+	// Parse the client IP
+	ip := net.ParseIP(clientIP)
+	if ip == nil {
+		log.Printf("Invalid client IP address: %s", clientIP)
+		return false
+	}
+
+	// Check if the IP is in any of the allowed CIDR ranges
+	for _, cidrStr := range allowedCIDRs {
+		_, cidrNet, err := net.ParseCIDR(cidrStr)
+		if err != nil {
+			log.Printf("Invalid CIDR range in configuration: %s - %v", cidrStr, err)
+			continue
+		}
+
+		if cidrNet.Contains(ip) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// getClientIP extracts the real client IP from the request, considering proxy headers
+func getClientIP(r *http.Request) string {
+	// Check X-Forwarded-For header first (for proxies/load balancers)
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff != "" {
+		// X-Forwarded-For can contain multiple IPs, take the first one
+		ips := strings.Split(xff, ",")
+		if len(ips) > 0 {
+			return strings.TrimSpace(ips[0])
+		}
+	}
+
+	// Check X-Real-IP header (some proxies use this)
+	xri := r.Header.Get("X-Real-IP")
+	if xri != "" {
+		return strings.TrimSpace(xri)
+	}
+
+	// Fall back to RemoteAddr (direct connection)
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// If SplitHostPort fails, RemoteAddr might be just an IP without port
+		return r.RemoteAddr
+	}
+	return host
+}
+
 // serviceOverviewHandler handles GET requests to show service configuration overview
 func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -589,6 +657,13 @@ func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
 		webhookSecurity = "Disabled (no signature verification)"
 	}
 
+	var ipRestrictions string
+	if len(appConfig.Server.AllowedCIDRs) > 0 {
+		ipRestrictions = "Enabled (CIDR filtering active)"
+	} else {
+		ipRestrictions = "Disabled (all IPs allowed)"
+	}
+
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
@@ -606,12 +681,15 @@ func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
         th { background-color: #f8f9fa; font-weight: bold; }
         .endpoint { font-family: monospace; background: #f8f9fa; padding: 2px 6px; border-radius: 3px; }
         .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; color: #666; font-size: 0.9em; }
+        .service-image { max-width: 800px; width: 100%%; height: auto; display: block; margin: 20px auto; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🔗 Go Gitea Jira Webhook Service</h1>
         
+        <img src="/go-gitea-jira-webhook.jpg" alt="Go Gitea Jira Webhook Service" class="service-image">
+
         <div class="status">
             <strong>Service Status:</strong> Running ✅<br>
             <strong>Build Version:</strong> %s<br>
@@ -627,6 +705,7 @@ func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
             <tr><td>Comment Visibility</td><td>%s</td></tr>
             <tr><td>Commit Buffering</td><td>%s</td></tr>
             <tr><td>Webhook Security</td><td>%s</td></tr>
+            <tr><td>IP Restrictions</td><td>%s</td></tr>
         </table>
 
         <h2>🎯 Special Features</h2>
@@ -649,6 +728,7 @@ func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
             <tr><td>GET</td><td class="endpoint">/</td><td>Service overview (this page)</td></tr>
             <tr><td>POST</td><td class="endpoint">/</td><td>Gitea webhook receiver</td></tr>
             <tr><td>POST</td><td class="endpoint">/gitea-webhook</td><td>Gitea webhook receiver (alternative)</td></tr>
+            <tr><td>GET</td><td class="endpoint">/go-gitea-jira-webhook.jpg</td><td>Service logo image</td></tr>
         </table>
 
         <h2>📝 Usage Instructions</h2>
@@ -668,7 +748,7 @@ func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
         </div>
     </div>
 </body>
-</html>`, buildversion, buildtime, appConfig.Jira.APIURL, appConfig.Jira.Username, projectFilter, visibilitySettings, bufferStatus, webhookSecurity, appConfig.Server.Port)
+</html>`, buildversion, buildtime, appConfig.Jira.APIURL, appConfig.Jira.Username, projectFilter, visibilitySettings, bufferStatus, webhookSecurity, ipRestrictions, appConfig.Server.Port)
 
 	fmt.Fprint(w, html)
 	log.Printf("Served service overview to %s", r.RemoteAddr)
@@ -681,6 +761,21 @@ func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST requests are accepted for webhooks", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Check if the client IP is allowed (if CIDR restrictions are configured)
+	clientIP := getClientIP(r)
+	if !isIPAllowed(clientIP, appConfig.Server.AllowedCIDRs) {
+		log.Printf("Webhook request from %s denied - IP not in allowed CIDR ranges: %v", clientIP, appConfig.Server.AllowedCIDRs)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		response := map[string]string{
+			"error":   "Forbidden",
+			"message": "Your IP address is not authorized to access this webhook endpoint",
+			"code":    "IP_NOT_ALLOWED",
+		}
+		json.NewEncoder(w).Encode(response)
 		return
 	}
 
@@ -1122,6 +1217,27 @@ func main() {
 
 	// Dedicated webhook handler
 	http.HandleFunc("/gitea-webhook", giteaWebhookHandler)
+
+	// Image handler for service overview page
+	http.HandleFunc("/go-gitea-jira-webhook.jpg", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Only GET requests are accepted for images", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Read the embedded image file
+		imageData, err := embeddedImage.ReadFile("go-gitea-jira-webhook.jpg")
+		if err != nil {
+			log.Printf("Error reading embedded image: %v", err)
+			http.Error(w, "Image not found", http.StatusNotFound)
+			return
+		}
+
+		// Set the appropriate content type and serve the image
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(imageData)))
+		w.Write(imageData)
+	})
 
 	// Use port from config, or default to 8443 if not set
 	port := appConfig.Server.Port
