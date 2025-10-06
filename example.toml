@@ -4,7 +4,7 @@ username = "your-jira-username"
 password = "your-jira-password"
 # projects_filter = ["PROJECTFOO", "PROJECTBAR"]  # Optional: Only process tickets from these projects
 # comment_visibility = "role:Member" # Optional: set comment visibility to certain values
-                                   # Use $TICKETID format in commits to force public visibility
+                                   # Use $TICKETID or #TICKETID format in commits to force public visibility
 
 [gitea]
 webhook_secret = "your-webhook-secret"  # Optional

@@ -7,8 +7,8 @@ A Go application that receives webhooks from Gitea and automatically adds commen
 ## Features
 
 - Receives Gitea push webhooks
-- Extracts Jira ticket IDs from commit messages using regex pattern `\b(\$?[A-Z]+-[0-9]+)\b`
-- **Public Comment Override**: Use `$TICKETID` format to force public visibility
+- Extracts Jira ticket IDs from commit messages using regex pattern `\b([\$#]?[A-Z]+-[0-9]+)\b`
+- **Public Comment Override**: Use `$TICKETID` or `#TICKETID` format to force public visibility
 - Automatically adds comments to Jira tickets with commit links
 - **Commit Buffering**: Optional buffering to reduce comment spam by batching commits over a configurable time period
 - **Service Overview**: Web-based configuration overview available via HTTP GET to root path
@@ -57,7 +57,7 @@ duration = "10m"   # Optional: buffer duration (e.g., "5s", "10m", "1h") - if se
 - **projects_filter**: (Optional) Array of Jira project codes to process. If empty or omitted, all projects will be processed.
 - **comment_visibility**: (Optional) Set comment visibility. Format: "type:value" (e.g., "role:Members", "group:developers"). If empty, comments will be public.
 
-**Public Comment Override**: Use `$TICKETID` format in commit messages (e.g., `$PROJ-123`) to force public visibility, bypassing the `comment_visibility` setting for that specific ticket.
+**Public Comment Override**: Use `$TICKETID` or `#TICKETID` format in commit messages (e.g., `$PROJ-123` or `#PROJ-123`) to force public visibility, bypassing the `comment_visibility` setting for that specific ticket.
 
 #### Buffering Section
 
@@ -247,10 +247,10 @@ Simply navigate to `https://your-server:8443/` in a web browser to view the curr
 
 ### Public Visibility Override
 
-You can force a comment to be public (bypassing the `comment_visibility` setting) by using the `$TICKETID` format in your commit messages:
+You can force a comment to be public (bypassing the `comment_visibility` setting) by using the `$TICKETID` or `#TICKETID` format in your commit messages:
 
 - **Normal format**: `PROJ-123` - Uses configured visibility settings
-- **Public format**: `$PROJ-123` - Forces comment to be public
+- **Public format**: `$PROJ-123` or `#PROJ-123` - Forces comment to be public
 
 Examples:
 
@@ -258,14 +258,15 @@ Examples:
 # This commit will use configured visibility (e.g., role:Members)
 git commit -m "Fix login bug for PROJ-123"
 
-# This commit will force public visibility, ignoring comment_visibility setting
+# These commits will force public visibility, ignoring comment_visibility setting
 git commit -m "Fix login bug for $PROJ-123"
+git commit -m "Fix login bug for #PROJ-123"  # Alternative format (bash-safe)
 
-# Mixed usage - the entire ticket comment will be public if ANY commit uses $
-git commit -m "Fix login bug for PROJ-123 and $PROJ-456"
+# Mixed usage - the entire ticket comment will be public if ANY commit uses $ or #
+git commit -m "Fix login bug for PROJ-123 and #PROJ-456"
 ```
 
-**Note**: If any commit referencing a ticket uses the `$` prefix, the entire bundled comment for that ticket will be public.
+**Note**: If any commit referencing a ticket uses the `$` or `#` prefix, the entire bundled comment for that ticket will be public. The `#` format is recommended when working in bash environments to avoid variable expansion issues.
 
 ### Commit Bundling
 

@@ -168,8 +168,8 @@ func loadConfiguration(configPath string) error {
 	}
 	jiraAPIToken = token
 
-	// Compile the regex once at startup - captures both $TICKETID (public) and TICKETID (normal) formats
-	jiraTicketRegex = regexp.MustCompile(`\b(\$?[A-Z]+-[0-9]+)\b`)
+	// Compile the regex once at startup - captures $TICKETID and #TICKETID (public) and TICKETID (normal) formats
+	jiraTicketRegex = regexp.MustCompile(`\b([\$#]?[A-Z]+-[0-9]+)\b`)
 
 	log.Println("Service initialized and configuration loaded.")
 	log.Printf("JIRA API URL: %s", appConfig.Jira.APIURL)
@@ -710,7 +710,7 @@ func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
 
         <h2>🎯 Special Features</h2>
         <div class="feature">
-            <strong>💬 Public Comment Override:</strong> Use <code>$TICKETID</code> format in commit messages (e.g., <code>$PROJ-123</code>) to force public visibility, bypassing the comment_visibility setting.
+            <strong>💬 Public Comment Override:</strong> Use <code>$TICKETID</code> or <code>#TICKETID</code> format in commit messages (e.g., <code>$PROJ-123</code> or <code>#PROJ-123</code>) to force public visibility, bypassing the comment_visibility setting.
         </div>
         <div class="feature">
             <strong>📦 Commit Bundling:</strong> Multiple commits referencing the same ticket are automatically bundled into a single comment.
@@ -739,7 +739,7 @@ func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
         <div class="feature">
             <strong>Commit Message Format:</strong><br>
             • Normal: <code>Fix bug for PROJ-123</code> (uses configured visibility)<br>
-            • Public: <code>Fix bug for $PROJ-123</code> (forces public visibility)
+            • Public: <code>Fix bug for $PROJ-123</code> or <code>Fix bug for #PROJ-123</code> (forces public visibility)
         </div>
 
         <div class="footer">
@@ -845,9 +845,9 @@ func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 					var ticketID string
 					var forcePublic bool
 
-					// Check if ticket has $ prefix for public visibility
-					if strings.HasPrefix(rawTicketID, "$") {
-						ticketID = rawTicketID[1:] // Remove $ prefix
+					// Check if ticket has $ or # prefix for public visibility
+					if strings.HasPrefix(rawTicketID, "$") || strings.HasPrefix(rawTicketID, "#") {
+						ticketID = rawTicketID[1:] // Remove $ or # prefix
 						forcePublic = true
 						log.Printf("Found public ticket reference: %s (will bypass visibility settings)", rawTicketID)
 					} else {
