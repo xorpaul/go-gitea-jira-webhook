@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -106,6 +107,11 @@ type CommitInfo struct {
 	URL       string
 	ShortID   string
 	Timestamp string // ISO 8601 timestamp from Gitea
+	Author    struct {
+		Name     string
+		Email    string
+		Username string
+	}
 }
 
 // TicketCommits represents all commits associated with a specific Jira ticket
@@ -888,6 +894,15 @@ func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 					URL:       commitURL,
 					ShortID:   commitID[:7],
 					Timestamp: commitTimestamp,
+					Author: struct {
+						Name     string
+						Email    string
+						Username string
+					}{
+						Name:     commit.Author.Name,
+						Email:    commit.Author.Email,
+						Username: commit.Author.Username,
+					},
 				}
 				ticketCommits[ticketID].Commits = append(ticketCommits[ticketID].Commits, commitInfo)
 				log.Printf("Found Jira ticket '%s' in commit %s. Added to bundle.", ticketID, commitID[:7])
@@ -1018,6 +1033,35 @@ func formatCommitTimestamp(timestamp string) string {
 	return t.Format("2006-01-02 15:04:05 MST")
 }
 
+// formatAuthorWithLink formats the author name with a profile link if username is valid
+func formatAuthorWithLink(authorName, authorUsername, repoURL string) string {
+	// Check if username exists and contains no spaces
+	if authorUsername != "" && !strings.Contains(authorUsername, " ") {
+		// Extract base URL from repository URL (e.g., https://git.ionos.org/repo/name -> https://git.ionos.org)
+		if baseURL := extractBaseURL(repoURL); baseURL != "" {
+			// Create profile link: [username](https://git.ionos.org/username)
+			profileURL := baseURL + "/" + authorUsername
+			return fmt.Sprintf("[%s](%s)", authorName, profileURL)
+		}
+	}
+	// Return plain author name if username is invalid or base URL can't be extracted
+	return authorName
+}
+
+// extractBaseURL extracts the base URL from a repository URL
+func extractBaseURL(repoURL string) string {
+	if repoURL == "" {
+		return ""
+	}
+	
+	// Parse the URL to extract the base (scheme + host)
+	if parsedURL, err := url.Parse(repoURL); err == nil {
+		return fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
+	}
+	
+	return ""
+}
+
 // addCommitLinkToJira adds a comment to the specified Jira ticket with bundled commits
 func addCommitLinkToJira(ticketData *TicketCommits) error {
 	jiraIssueURL := fmt.Sprintf("%s/rest/api/2/issue/%s/comment", appConfig.Jira.APIURL, ticketData.TicketID)
@@ -1048,9 +1092,19 @@ func addCommitLinkToJira(ticketData *TicketCommits) error {
 			displayMessage = displayMessage[:100] + "..."
 		}
 		formattedTime := formatCommitTimestamp(commit.Timestamp)
+		
+		// Format author information with profile link
+		authorWithLink := formatAuthorWithLink(commit.Author.Name, commit.Author.Username, ticketData.RepoURL)
+		authorInfo := authorWithLink
+		if commit.Author.Username != "" && commit.Author.Username != commit.Author.Name && !strings.Contains(commit.Author.Username, " ") {
+			// If we have a valid username different from name, show both (but the name will already be linked)
+			authorInfo = fmt.Sprintf("%s (%s)", authorWithLink, commit.Author.Username)
+		}
+		
 		commentLines = append(commentLines, fmt.Sprintf("Associated Gitea Commit: %s (%s)", displayMessage, commit.ShortID))
 		commentLines = append(commentLines, fmt.Sprintf("Commit URL: %s", commit.URL))
 		commentLines = append(commentLines, fmt.Sprintf("Commit Date: %s", formattedTime))
+		commentLines = append(commentLines, fmt.Sprintf("Author: %s", authorInfo))
 		commentLines = append(commentLines, fmt.Sprintf("Repository: %s (%s)", ticketData.RepoName, ticketData.RepoURL))
 	} else {
 		// Multiple commits format
@@ -1064,9 +1118,19 @@ func addCommitLinkToJira(ticketData *TicketCommits) error {
 				displayMessage = displayMessage[:80] + "..."
 			}
 			formattedTime := formatCommitTimestamp(commit.Timestamp)
+			
+			// Format author information with profile link
+			authorWithLink := formatAuthorWithLink(commit.Author.Name, commit.Author.Username, ticketData.RepoURL)
+			authorInfo := authorWithLink
+			if commit.Author.Username != "" && commit.Author.Username != commit.Author.Name && !strings.Contains(commit.Author.Username, " ") {
+				// If we have a valid username different from name, show both (but the name will already be linked)
+				authorInfo = fmt.Sprintf("%s (%s)", authorWithLink, commit.Author.Username)
+			}
+			
 			commentLines = append(commentLines, fmt.Sprintf("%d. %s (%s)", i+1, displayMessage, commit.ShortID))
 			commentLines = append(commentLines, fmt.Sprintf("   %s", commit.URL))
 			commentLines = append(commentLines, fmt.Sprintf("   %s", formattedTime))
+			commentLines = append(commentLines, fmt.Sprintf("   Author: %s", authorInfo))
 			if i < len(ticketData.Commits)-1 {
 				commentLines = append(commentLines, "")
 			}
