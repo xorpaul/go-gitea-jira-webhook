@@ -4,7 +4,10 @@ username = "your-jira-username"
 password = "your-jira-password"
 # projects_filter = ["PROJECTFOO", "PROJECTBAR"]  # Optional: Only process tickets from these projects
 # comment_visibility = "role:Member" # Optional: set comment visibility to certain values
-                                   # Use $TICKETID or #TICKETID format in commits to force public visibility
+                                   # Special prefixes and suffixes in commit messages:
+                                   # - $TICKETID or #TICKETID: force public visibility
+                                   # - %TICKETID or TICKETID!: skip buffering and post immediately  
+                                   # - #%TICKETID, $%TICKETID, #TICKETID!, $TICKETID!: combine public + immediate
 
 [gitea]
 webhook_secret = "your-webhook-secret"  # Optional
@@ -19,3 +22,4 @@ port = "8443"
 
 [buffering]
 duration = "10m"   # Optional: buffer duration (e.g., "5s", "10m", "1h") - if set, buffering is enabled
+                   # Use %TICKETID prefix or TICKETID! suffix in commit messages to bypass buffering for urgent updates

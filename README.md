@@ -7,8 +7,10 @@ A Go application that receives webhooks from Gitea and automatically adds commen
 ## Features
 
 - Receives Gitea push webhooks
-- Extracts Jira ticket IDs from commit messages using regex pattern `\b([\$#]?[A-Z]+-[0-9]+)\b`
+- Extracts Jira ticket IDs from commit messages using regex pattern `(^|[^A-Za-z0-9-])([\$#%]*[A-Z]+-[0-9]+)(?:[^A-Za-z0-9-]|$)`
 - **Public Comment Override**: Use `$TICKETID` or `#TICKETID` format to force public visibility
+- **Immediate Posting**: Use `%TICKETID` format to skip buffering and post comments immediately
+- **Combined Prefixes**: Use combinations like `#%TICKETID` or `$%TICKETID` for both public visibility and immediate posting
 - Automatically adds comments to Jira tickets with commit links
 - **Commit Buffering**: Optional buffering to reduce comment spam by batching commits over a configurable time period
 - **Service Overview**: Web-based configuration overview available via HTTP GET to root path
@@ -57,7 +59,11 @@ duration = "10m"   # Optional: buffer duration (e.g., "5s", "10m", "1h") - if se
 - **projects_filter**: (Optional) Array of Jira project codes to process. If empty or omitted, all projects will be processed.
 - **comment_visibility**: (Optional) Set comment visibility. Format: "type:value" (e.g., "role:Members", "group:developers"). If empty, comments will be public.
 
-**Public Comment Override**: Use `$TICKETID` or `#TICKETID` format in commit messages (e.g., `$PROJ-123` or `#PROJ-123`) to force public visibility, bypassing the `comment_visibility` setting for that specific ticket.
+**Special Ticket Prefixes and Suffixes**: Use special prefixes and suffixes in commit messages for enhanced functionality:
+
+- **Public Override**: `$TICKETID` or `#TICKETID` (e.g., `$PROJ-123`, `#PROJ-123`) - Forces public visibility, bypassing the `comment_visibility` setting
+- **Immediate Posting**: `%TICKETID` (e.g., `%PROJ-123`) or `TICKETID!` (e.g., `PROJ-123!`) - Skips buffering and posts the comment immediately
+- **Combined**: `#%TICKETID`, `$%TICKETID`, `#TICKETID!`, `$TICKETID!` (e.g., `#%PROJ-123`, `#PROJ-123!`) - Combines public visibility with immediate posting
 
 #### Buffering Section
 
@@ -245,22 +251,34 @@ Simply navigate to `https://your-server:8443/` in a web browser to view the curr
    - **Single commit**: Link to the commit, commit message (truncated if too long), repository information
    - **Multiple commits**: List of all commits with links, commit messages, and repository information
 
-### Public Visibility Override
+### Special Ticket Prefixes
 
-You can force a comment to be public (bypassing the `comment_visibility` setting) by using the `$TICKETID` or `#TICKETID` format in your commit messages:
+You can use special prefixes in commit messages to control comment visibility and buffering behavior:
 
-- **Normal format**: `PROJ-123` - Uses configured visibility settings
+- **Normal format**: `PROJ-123` - Uses configured visibility settings and buffering
 - **Public format**: `$PROJ-123` or `#PROJ-123` - Forces comment to be public
+- **Immediate format**: `%PROJ-123` or `PROJ-123!` - Skips buffering and posts immediately
+- **Combined format**: `#%PROJ-123`, `$%PROJ-123`, `#PROJ-123!`, `$PROJ-123!`, etc. - Combines effects
 
 Examples:
 
 ```bash
-# This commit will use configured visibility (e.g., role:Members)
+# Normal: Uses configured visibility and buffering
 git commit -m "Fix login bug for PROJ-123"
 
-# These commits will force public visibility, ignoring comment_visibility setting
+# Public: Forces public visibility, uses buffering
 git commit -m "Fix login bug for $PROJ-123"
 git commit -m "Fix login bug for #PROJ-123"  # Alternative format (bash-safe)
+
+# Immediate: Uses configured visibility, skips buffering
+git commit -m "Urgent hotfix for %PROJ-123"
+git commit -m "Urgent hotfix for PROJ-123!"  # Alternative suffix format
+
+# Combined: Public visibility AND immediate posting
+git commit -m "Critical security fix for #%PROJ-123"
+git commit -m "Critical security fix for #PROJ-123!"  # Alternative with suffix
+git commit -m "Emergency patch for $%PROJ-123"
+git commit -m "Emergency patch for $PROJ-123!"  # Alternative with suffix
 
 # Mixed usage - the entire ticket comment will be public if ANY commit uses $ or #
 git commit -m "Fix login bug for PROJ-123 and #PROJ-456"

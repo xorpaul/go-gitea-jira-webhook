@@ -116,11 +116,12 @@ type CommitInfo struct {
 
 // TicketCommits represents all commits associated with a specific Jira ticket
 type TicketCommits struct {
-	TicketID    string
-	Commits     []CommitInfo
-	RepoURL     string
-	RepoName    string
-	ForcePublic bool // True if any commit used $TICKETID format to force public visibility
+	TicketID       string
+	Commits        []CommitInfo
+	RepoURL        string
+	RepoName       string
+	ForcePublic    bool // True if any commit used $TICKETID or #TICKETID format to force public visibility
+	ForceImmediate bool // True if any commit used %TICKETID format to skip buffering and post immediately
 }
 
 // BufferedTicket represents a ticket with buffered commits and timer
@@ -174,8 +175,8 @@ func loadConfiguration(configPath string) error {
 	}
 	jiraAPIToken = token
 
-	// Compile the regex once at startup - captures $TICKETID and #TICKETID (public) and TICKETID (normal) formats
-	jiraTicketRegex = regexp.MustCompile(`\b([\$#]?[A-Z]+-[0-9]+)\b`)
+	// Compile the regex once at startup - captures $TICKETID, #TICKETID (public), %TICKETID (immediate), TICKETID! (immediate), and combinations
+	jiraTicketRegex = regexp.MustCompile(`(^|[^A-Za-z0-9-!])([\$#%]*[A-Z]+-[0-9]+!?)(?:[^A-Za-z0-9-!]|$)`)
 
 	log.Println("Service initialized and configuration loaded.")
 	log.Printf("JIRA API URL: %s", appConfig.Jira.APIURL)
@@ -716,7 +717,10 @@ func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
 
         <h2>🎯 Special Features</h2>
         <div class="feature">
-            <strong>💬 Public Comment Override:</strong> Use <code>$TICKETID</code> or <code>#TICKETID</code> format in commit messages (e.g., <code>$PROJ-123</code> or <code>#PROJ-123</code>) to force public visibility, bypassing the comment_visibility setting.
+            <strong>💬 Special Ticket Prefixes &amp; Suffixes:</strong> Use prefixes and suffixes in commit messages for enhanced functionality:<br>
+            • <code>$TICKETID</code> or <code>#TICKETID</code> - Forces public visibility<br>
+            • <code>%%TICKETID</code> or <code>TICKETID!</code> - Skips buffering and posts immediately<br>
+            • <code>#%%TICKETID</code>, <code>$%%TICKETID</code>, <code>#TICKETID!</code>, or <code>$TICKETID!</code> - Combines public visibility with immediate posting
         </div>
         <div class="feature">
             <strong>📦 Commit Bundling:</strong> Multiple commits referencing the same ticket are automatically bundled into a single comment.
@@ -744,8 +748,10 @@ func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
         </div>
         <div class="feature">
             <strong>Commit Message Format:</strong><br>
-            • Normal: <code>Fix bug for PROJ-123</code> (uses configured visibility)<br>
-            • Public: <code>Fix bug for $PROJ-123</code> or <code>Fix bug for #PROJ-123</code> (forces public visibility)
+            • Normal: <code>Fix bug for PROJ-123</code> (configured visibility, buffered)<br>
+            • Public: <code>Fix bug for $PROJ-123</code> or <code>Fix bug for #PROJ-123</code> (public visibility, buffered)<br>
+            • Immediate: <code>Urgent fix for %%PROJ-123</code> or <code>Urgent fix for PROJ-123!</code> (configured visibility, immediate)<br>
+            • Combined: <code>Critical fix for #%%PROJ-123</code> or <code>Critical fix for #PROJ-123!</code> (public visibility, immediate)
         </div>
 
         <div class="footer">
@@ -843,49 +849,96 @@ func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Processing commit %s: '%s'", commitID[:7], commitMessage)
 
 		foundJiraTickets := jiraTicketRegex.FindAllStringSubmatch(commitMessage, -1)
+		log.Printf("Regex matches for message '%s': %v", commitMessage, foundJiraTickets)
 		if len(foundJiraTickets) > 0 {
-			uniqueTickets := make(map[string]bool) // bool indicates if ticket should be public
+			// Track flags for each unique ticket
+			type TicketFlags struct {
+				ForcePublic    bool
+				ForceImmediate bool
+			}
+			uniqueTickets := make(map[string]*TicketFlags)
 			for _, match := range foundJiraTickets {
-				if len(match) > 1 {
-					rawTicketID := match[1]
+				log.Printf("Processing match: %v", match)
+				if len(match) > 2 {
+					rawTicketID := match[2]
 					var ticketID string
 					var forcePublic bool
+					var forceImmediate bool
 
-					// Check if ticket has $ or # prefix for public visibility
-					if strings.HasPrefix(rawTicketID, "$") || strings.HasPrefix(rawTicketID, "#") {
-						ticketID = rawTicketID[1:] // Remove $ or # prefix
-						forcePublic = true
+					// Parse prefixes: $, #, % and combinations, plus ! suffix
+					prefixes := ""
+					actualTicket := rawTicketID
+					hasSuffix := false
+
+					// Extract all leading prefix characters
+					for len(actualTicket) > 0 && (actualTicket[0] == '$' || actualTicket[0] == '#' || actualTicket[0] == '%') {
+						prefixes += string(actualTicket[0])
+						actualTicket = actualTicket[1:]
+					}
+
+					// Check for ! suffix
+					if len(actualTicket) > 0 && actualTicket[len(actualTicket)-1] == '!' {
+						hasSuffix = true
+						actualTicket = actualTicket[:len(actualTicket)-1] // Remove ! from end
+					}
+
+					ticketID = actualTicket
+
+					// Determine flags based on prefixes and suffix
+					forcePublic = strings.Contains(prefixes, "$") || strings.Contains(prefixes, "#")
+					forceImmediate = strings.Contains(prefixes, "%") || hasSuffix
+
+					// Log what was detected
+					immediateReason := ""
+					if strings.Contains(prefixes, "%") && hasSuffix {
+						immediateReason = "(%% prefix and ! suffix)"
+					} else if strings.Contains(prefixes, "%") {
+						immediateReason = "(%% prefix)"
+					} else if hasSuffix {
+						immediateReason = "(! suffix)"
+					}
+
+					if forcePublic && forceImmediate {
+						log.Printf("Found immediate public ticket reference: %s %s (will bypass buffering and visibility settings)", rawTicketID, immediateReason)
+					} else if forcePublic {
 						log.Printf("Found public ticket reference: %s (will bypass visibility settings)", rawTicketID)
+					} else if forceImmediate {
+						log.Printf("Found immediate ticket reference: %s %s (will bypass buffering)", rawTicketID, immediateReason)
 					} else {
-						ticketID = rawTicketID
-						forcePublic = false
+						log.Printf("Found normal ticket reference: %s", rawTicketID)
 					}
 
 					// Check if ticket is in allowed projects
 					if isTicketAllowed(ticketID) {
-						// If ticket already seen, preserve public flag if any reference was public
+						// If ticket already seen, preserve flags if any reference had them
 						if existing, exists := uniqueTickets[ticketID]; exists {
-							uniqueTickets[ticketID] = existing || forcePublic
+							existing.ForcePublic = existing.ForcePublic || forcePublic
+							existing.ForceImmediate = existing.ForceImmediate || forceImmediate
 						} else {
-							uniqueTickets[ticketID] = forcePublic
+							uniqueTickets[ticketID] = &TicketFlags{
+								ForcePublic:    forcePublic,
+								ForceImmediate: forceImmediate,
+							}
 						}
 					}
 				}
 			}
 
 			// Add this commit to each unique ticket it references
-			for ticketID, forcePublic := range uniqueTickets {
+			for ticketID, flags := range uniqueTickets {
 				if ticketCommits[ticketID] == nil {
 					ticketCommits[ticketID] = &TicketCommits{
-						TicketID:    ticketID,
-						Commits:     []CommitInfo{},
-						RepoURL:     repoURL,
-						RepoName:    repoName,
-						ForcePublic: forcePublic,
+						TicketID:       ticketID,
+						Commits:        []CommitInfo{},
+						RepoURL:        repoURL,
+						RepoName:       repoName,
+						ForcePublic:    flags.ForcePublic,
+						ForceImmediate: flags.ForceImmediate,
 					}
 				} else {
-					// If any reference was public, mark the whole ticket as public
-					ticketCommits[ticketID].ForcePublic = ticketCommits[ticketID].ForcePublic || forcePublic
+					// If any reference had flags, mark the whole ticket with those flags
+					ticketCommits[ticketID].ForcePublic = ticketCommits[ticketID].ForcePublic || flags.ForcePublic
+					ticketCommits[ticketID].ForceImmediate = ticketCommits[ticketID].ForceImmediate || flags.ForceImmediate
 				}
 
 				commitInfo := CommitInfo{
@@ -912,17 +965,23 @@ func giteaWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Process tickets based on buffering configuration
-	if appConfig.Buffering.Duration != "" {
-		// Add commits to buffer instead of processing immediately
-		for ticketID, ticketData := range ticketCommits {
-			for _, commit := range ticketData.Commits {
-				addCommitToBuffer(ticketID, commit, ticketData.RepoURL, ticketData.RepoName, ticketData.ForcePublic)
+	// Process tickets based on buffering configuration and immediate flags
+	for ticketID, ticketData := range ticketCommits {
+		if ticketData.ForceImmediate {
+			// Process immediately when % prefix is used, bypassing buffering
+			log.Printf("Processing ticket %s immediately due to %% prefix (bypassing buffering) with %d commit(s)", ticketID, len(ticketData.Commits))
+			if err := addCommitLinkToJira(ticketData); err != nil {
+				log.Printf("Failed to update Jira ticket %s: %v", ticketID, err)
+			} else {
+				log.Printf("Successfully updated Jira ticket %s immediately with %d commit(s).", ticketID, len(ticketData.Commits))
 			}
-		}
-	} else {
-		// Process each ticket with all its associated commits immediately (legacy behavior)
-		for ticketID, ticketData := range ticketCommits {
+		} else if appConfig.Buffering.Duration != "" {
+			// Add commits to buffer for normal processing
+			for _, commit := range ticketData.Commits {
+				addCommitToBuffer(ticketID, commit, ticketData.RepoURL, ticketData.RepoName, ticketData.ForcePublic, ticketData.ForceImmediate)
+			}
+		} else {
+			// Process each ticket with all its associated commits immediately (legacy behavior)
 			log.Printf("Processing ticket %s with %d commit(s)", ticketID, len(ticketData.Commits))
 			if err := addCommitLinkToJira(ticketData); err != nil {
 				log.Printf("Failed to update Jira ticket %s: %v", ticketID, err)
@@ -965,7 +1024,7 @@ func processBufferedTicket(ticketID string) {
 }
 
 // addCommitToBuffer adds a commit to the buffer for a ticket
-func addCommitToBuffer(ticketID string, commitInfo CommitInfo, repoURL, repoName string, forcePublic bool) {
+func addCommitToBuffer(ticketID string, commitInfo CommitInfo, repoURL, repoName string, forcePublic, forceImmediate bool) {
 	bufferMutex.Lock()
 	defer bufferMutex.Unlock()
 
@@ -974,11 +1033,12 @@ func addCommitToBuffer(ticketID string, commitInfo CommitInfo, repoURL, repoName
 		// First commit for this ticket - create new buffer entry
 		bufferedTicket = &BufferedTicket{
 			TicketData: &TicketCommits{
-				TicketID:    ticketID,
-				Commits:     []CommitInfo{commitInfo},
-				RepoURL:     repoURL,
-				RepoName:    repoName,
-				ForcePublic: forcePublic,
+				TicketID:       ticketID,
+				Commits:        []CommitInfo{commitInfo},
+				RepoURL:        repoURL,
+				RepoName:       repoName,
+				ForcePublic:    forcePublic,
+				ForceImmediate: forceImmediate,
 			},
 			FirstSeen: time.Now(),
 		}
@@ -995,6 +1055,8 @@ func addCommitToBuffer(ticketID string, commitInfo CommitInfo, repoURL, repoName
 		bufferedTicket.TicketData.Commits = append(bufferedTicket.TicketData.Commits, commitInfo)
 		// If any commit forces public, mark the whole ticket as public
 		bufferedTicket.TicketData.ForcePublic = bufferedTicket.TicketData.ForcePublic || forcePublic
+		// If any commit forces immediate, mark the whole ticket as immediate
+		bufferedTicket.TicketData.ForceImmediate = bufferedTicket.TicketData.ForceImmediate || forceImmediate
 		log.Printf("Added commit to buffer for ticket %s (total: %d commits)", ticketID, len(bufferedTicket.TicketData.Commits))
 	}
 }
@@ -1053,12 +1115,12 @@ func extractBaseURL(repoURL string) string {
 	if repoURL == "" {
 		return ""
 	}
-	
+
 	// Parse the URL to extract the base (scheme + host)
 	if parsedURL, err := url.Parse(repoURL); err == nil {
 		return fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
 	}
-	
+
 	return ""
 }
 
@@ -1092,7 +1154,7 @@ func addCommitLinkToJira(ticketData *TicketCommits) error {
 			displayMessage = displayMessage[:100] + "..."
 		}
 		formattedTime := formatCommitTimestamp(commit.Timestamp)
-		
+
 		// Format author information with profile link
 		authorWithLink := formatAuthorWithLink(commit.Author.Name, commit.Author.Username, ticketData.RepoURL)
 		authorInfo := authorWithLink
@@ -1100,7 +1162,7 @@ func addCommitLinkToJira(ticketData *TicketCommits) error {
 			// If we have a valid username different from name, show both (but the name will already be linked)
 			authorInfo = fmt.Sprintf("%s (%s)", authorWithLink, commit.Author.Username)
 		}
-		
+
 		commentLines = append(commentLines, fmt.Sprintf("Associated Gitea Commit: %s (%s)", displayMessage, commit.ShortID))
 		commentLines = append(commentLines, fmt.Sprintf("Commit URL: %s", commit.URL))
 		commentLines = append(commentLines, fmt.Sprintf("Commit Date: %s", formattedTime))
@@ -1118,7 +1180,7 @@ func addCommitLinkToJira(ticketData *TicketCommits) error {
 				displayMessage = displayMessage[:80] + "..."
 			}
 			formattedTime := formatCommitTimestamp(commit.Timestamp)
-			
+
 			// Format author information with profile link
 			authorWithLink := formatAuthorWithLink(commit.Author.Name, commit.Author.Username, ticketData.RepoURL)
 			authorInfo := authorWithLink
@@ -1126,7 +1188,7 @@ func addCommitLinkToJira(ticketData *TicketCommits) error {
 				// If we have a valid username different from name, show both (but the name will already be linked)
 				authorInfo = fmt.Sprintf("%s (%s)", authorWithLink, commit.Author.Username)
 			}
-			
+
 			commentLines = append(commentLines, fmt.Sprintf("%d. %s (%s)", i+1, displayMessage, commit.ShortID))
 			commentLines = append(commentLines, fmt.Sprintf("   %s", commit.URL))
 			commentLines = append(commentLines, fmt.Sprintf("   %s", formattedTime))
@@ -1148,6 +1210,7 @@ func addCommitLinkToJira(ticketData *TicketCommits) error {
 		"body": commentText,
 	}
 	// Add visibility if configured and not forced to be public
+	log.Printf("Creating comment for %s: ForcePublic=%v, CommentVisibility=%s", ticketData.TicketID, ticketData.ForcePublic, appConfig.Jira.CommentVisibility)
 	if appConfig.Jira.CommentVisibility != "" && !ticketData.ForcePublic {
 		// Format: "role:Members" or "group:SomeGroup"
 		parts := strings.SplitN(appConfig.Jira.CommentVisibility, ":", 2)
@@ -1156,7 +1219,10 @@ func addCommitLinkToJira(ticketData *TicketCommits) error {
 				"type":  parts[0],
 				"value": parts[1],
 			}
+			log.Printf("Adding visibility restriction: %s:%s", parts[0], parts[1])
 		}
+	} else if ticketData.ForcePublic {
+		log.Printf("Comment will be public due to ForcePublic flag")
 	}
 
 	if ticketData.ForcePublic {
