@@ -1,4 +1,4 @@
-module git.ionos.org/ITOHI-public/go-gitea-jira-webhook
+module github.com/xorpaul/go-gitea-jira-webhook.git
 
 go 1.24.6
 
