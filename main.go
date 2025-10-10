@@ -1099,9 +1099,9 @@ func formatCommitTimestamp(timestamp string) string {
 func formatAuthorWithLink(authorName, authorUsername, repoURL string) string {
 	// Check if username exists and contains no spaces
 	if authorUsername != "" && !strings.Contains(authorUsername, " ") {
-		// Extract base URL from repository URL (e.g., https://git.ionos.org/repo/name -> https://git.ionos.org)
+		// Extract base URL from repository URL (e.g., https://gitea.domain.tld/repo/name -> https://gitea.domain.tld)
 		if baseURL := extractBaseURL(repoURL); baseURL != "" {
-			// Create profile link: [username|https://git.ionos.org/username] (Jira syntax)
+			// Create profile link: [username|https://gitea.domain.tld/username] (Jira syntax)
 			profileURL := baseURL + "/" + authorUsername
 			return fmt.Sprintf("[%s|%s]", authorName, profileURL)
 		}
