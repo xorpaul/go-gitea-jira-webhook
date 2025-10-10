@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v0.0.2.html).
 
+## [Unreleased] - v0.0.7
+
+### Enhanced
+
+- **Repository Links in Jira Comments**: Repository names in Jira comments are now clickable links using Jira syntax `[RepoName|URL]` instead of plain text
+
+### Fixed
+
+- **Jira Link Syntax**: Corrected author profile links from Markdown syntax `[name](url)` to proper Jira syntax `[name|url]`
+
 ## [v0.0.6] - 2025-10-10
 
 ### Added

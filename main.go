@@ -1101,9 +1101,9 @@ func formatAuthorWithLink(authorName, authorUsername, repoURL string) string {
 	if authorUsername != "" && !strings.Contains(authorUsername, " ") {
 		// Extract base URL from repository URL (e.g., https://git.ionos.org/repo/name -> https://git.ionos.org)
 		if baseURL := extractBaseURL(repoURL); baseURL != "" {
-			// Create profile link: [username](https://git.ionos.org/username)
+			// Create profile link: [username|https://git.ionos.org/username] (Jira syntax)
 			profileURL := baseURL + "/" + authorUsername
-			return fmt.Sprintf("[%s](%s)", authorName, profileURL)
+			return fmt.Sprintf("[%s|%s]", authorName, profileURL)
 		}
 	}
 	// Return plain author name if username is invalid or base URL can't be extracted
@@ -1167,11 +1167,11 @@ func addCommitLinkToJira(ticketData *TicketCommits) error {
 		commentLines = append(commentLines, fmt.Sprintf("Commit URL: %s", commit.URL))
 		commentLines = append(commentLines, fmt.Sprintf("Commit Date: %s", formattedTime))
 		commentLines = append(commentLines, fmt.Sprintf("Author: %s", authorInfo))
-		commentLines = append(commentLines, fmt.Sprintf("Repository: %s (%s)", ticketData.RepoName, ticketData.RepoURL))
+		commentLines = append(commentLines, fmt.Sprintf("Repository: [%s|%s]", ticketData.RepoName, ticketData.RepoURL))
 	} else {
 		// Multiple commits format
 		commentLines = append(commentLines, fmt.Sprintf("Associated Gitea Commits (%d commits):", len(ticketData.Commits)))
-		commentLines = append(commentLines, fmt.Sprintf("Repository: %s (%s)", ticketData.RepoName, ticketData.RepoURL))
+		commentLines = append(commentLines, fmt.Sprintf("Repository: [%s|%s]", ticketData.RepoName, ticketData.RepoURL))
 		commentLines = append(commentLines, "")
 
 		for i, commit := range ticketData.Commits {
