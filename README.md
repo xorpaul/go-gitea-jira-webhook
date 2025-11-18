@@ -41,6 +41,7 @@ webhook_secret = "your-webhook-secret"  # Optional
 [ssl]
 cert_file = "/path/to/cert.pem"
 key_file = "/path/to/key.pem"
+auto_reload_certs = true  # Optional: automatically reload certificates when changed (default: true)
 
 [server]
 port = "8443"
@@ -101,6 +102,38 @@ password = "your-jira-password"
 ```
 
 **Note**: The application will automatically create a Jira API token using your username and password at startup. The API token is generated dynamically and used for all subsequent Jira API calls. Tokens are cached locally and automatically renewed when they expire or are near expiration (within 7 days).
+
+#### SSL Section
+
+- **cert_file**: Path to the SSL certificate file (required)
+- **key_file**: Path to the SSL key file (required)
+- **auto_reload_certs**: (Optional, default: true) Automatically monitor and reload certificates when they change on the filesystem
+
+**Certificate Auto-Reload:**
+
+When enabled (default), the application checks every 20 minutes if the certificate files have been modified. If a change is detected:
+
+1. The application waits for all buffered tickets to be processed
+2. Once the buffer is empty, it gracefully restarts to load the new certificates
+3. This prevents service interruptions during certificate renewals (e.g., Let's Encrypt)
+
+Example configuration:
+
+```toml
+[ssl]
+cert_file = "/etc/letsencrypt/live/example.com/fullchain.pem"
+key_file = "/etc/letsencrypt/live/example.com/privkey.pem"
+auto_reload_certs = true  # Enable automatic certificate reload (default)
+```
+
+To disable automatic reloading:
+
+```toml
+[ssl]
+cert_file = "/path/to/cert.pem"
+key_file = "/path/to/key.pem"
+auto_reload_certs = false  # Disable automatic certificate reload
+```
 
 #### Server Section
 

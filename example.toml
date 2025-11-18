@@ -15,6 +15,8 @@ webhook_secret = "your-webhook-secret"  # Optional
 [ssl]
 cert_file = "/path/to/cert.pem"
 key_file = "/path/to/key.pem"
+auto_reload_certs = true  # Optional: automatically reload certificates when changed (default: true)
+                          # Checks every 20 minutes and restarts gracefully when buffer is empty
 
 [server]
 port = "8443"

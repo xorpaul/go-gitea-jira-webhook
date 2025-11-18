@@ -73,8 +73,9 @@ type Config struct {
 		WebhookSecret string `toml:"webhook_secret"` // Optional
 	} `toml:"gitea"`
 	SSL struct {
-		CertFile string `toml:"cert_file"`
-		KeyFile  string `toml:"key_file"`
+		CertFile         string `toml:"cert_file"`
+		KeyFile          string `toml:"key_file"`
+		AutoReloadCerts  bool   `toml:"auto_reload_certs"` // Optional: auto-reload certificates when changed (default: true)
 	} `toml:"ssl"`
 	Server struct {
 		Port         string   `toml:"port"`          // Can also be hardcoded to 8443
@@ -141,10 +142,19 @@ var (
 	bufferMutex     sync.Mutex
 	bufferedTickets map[string]*BufferedTicket
 	bufferDuration  time.Duration
+
+	// Certificate monitoring variables
+	certModTime     time.Time
+	keyModTime      time.Time
+	restartRequested bool
+	restartMutex    sync.Mutex
 )
 
 // loadConfiguration loads and validates the configuration from the specified file
 func loadConfiguration(configPath string) error {
+	// Set defaults before loading config
+	appConfig.SSL.AutoReloadCerts = true // Default to enabled
+	
 	// Load configuration from TOML file
 	if _, err := toml.DecodeFile(configPath, &appConfig); err != nil {
 		return fmt.Errorf("error loading configuration from %s: %v", configPath, err)
@@ -208,6 +218,18 @@ func loadConfiguration(configPath string) error {
 		log.Printf("Commit buffering enabled with duration: %s", bufferDuration)
 	} else {
 		log.Println("Commit buffering disabled - comments will be posted immediately")
+	}
+
+	// Store initial certificate modification times
+	if err := updateCertModTimes(); err != nil {
+		log.Printf("Warning: Could not read certificate modification times: %v", err)
+	}
+
+	// Set default for auto_reload_certs if not explicitly set
+	if appConfig.SSL.AutoReloadCerts {
+		log.Println("Certificate auto-reload enabled (checks every 20 minutes)")
+	} else {
+		log.Println("Certificate auto-reload disabled")
 	}
 
 	return nil
@@ -466,6 +488,117 @@ func startPeriodicTokenRenewal() {
 			} else {
 				log.Println("Periodic check: Token is still valid, no renewal needed")
 			}
+		}
+	}()
+}
+
+// updateCertModTimes updates the stored modification times for certificate files
+func updateCertModTimes() error {
+	certInfo, err := os.Stat(appConfig.SSL.CertFile)
+	if err != nil {
+		return fmt.Errorf("error reading cert file info: %w", err)
+	}
+	certModTime = certInfo.ModTime()
+
+	keyInfo, err := os.Stat(appConfig.SSL.KeyFile)
+	if err != nil {
+		return fmt.Errorf("error reading key file info: %w", err)
+	}
+	keyModTime = keyInfo.ModTime()
+
+	return nil
+}
+
+// checkCertificateChanges checks if certificate files have been modified
+func checkCertificateChanges() (bool, error) {
+	certInfo, err := os.Stat(appConfig.SSL.CertFile)
+	if err != nil {
+		return false, fmt.Errorf("error reading cert file info: %w", err)
+	}
+
+	keyInfo, err := os.Stat(appConfig.SSL.KeyFile)
+	if err != nil {
+		return false, fmt.Errorf("error reading key file info: %w", err)
+	}
+
+	// Check if either file has been modified
+	if !certInfo.ModTime().Equal(certModTime) || !keyInfo.ModTime().Equal(keyModTime) {
+		log.Printf("Certificate change detected - Cert: %s (was %s), Key: %s (was %s)",
+			certInfo.ModTime().Format(time.RFC3339),
+			certModTime.Format(time.RFC3339),
+			keyInfo.ModTime().Format(time.RFC3339),
+			keyModTime.Format(time.RFC3339))
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// startCertificateMonitoring starts a background goroutine that checks for certificate changes every 20 minutes
+func startCertificateMonitoring() {
+	if !appConfig.SSL.AutoReloadCerts {
+		return
+	}
+
+	go func() {
+		log.Println("Starting certificate monitoring (checks every 20 minutes)")
+		ticker := time.NewTicker(20 * time.Minute)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			log.Println("Performing periodic certificate change check...")
+
+			changed, err := checkCertificateChanges()
+			if err != nil {
+				log.Printf("Warning: Could not check certificate changes: %v", err)
+				continue
+			}
+
+			if changed {
+				log.Println("Certificate files have changed. Initiating graceful restart...")
+				requestRestart()
+			}
+		}
+	}()
+}
+
+// requestRestart signals that a restart is needed and waits for buffers to clear
+func requestRestart() {
+	restartMutex.Lock()
+	if restartRequested {
+		restartMutex.Unlock()
+		return // Already requested
+	}
+	restartRequested = true
+	restartMutex.Unlock()
+
+	go func() {
+		log.Println("Restart requested. Waiting for buffered tickets to be processed...")
+		
+		// Check every 30 seconds if buffer is empty
+		for {
+			bufferMutex.Lock()
+			bufferCount := len(bufferedTickets)
+			bufferMutex.Unlock()
+
+			if bufferCount == 0 {
+				log.Println("All buffered tickets processed. Initiating restart...")
+				break
+			}
+
+			log.Printf("Waiting for %d buffered ticket(s) to be processed before restart...", bufferCount)
+			time.Sleep(30 * time.Second)
+		}
+
+		// Trigger restart by sending SIGTERM to self
+		log.Println("Sending SIGTERM to self for graceful restart")
+		process, err := os.FindProcess(os.Getpid())
+		if err != nil {
+			log.Printf("Error finding process: %v", err)
+			return
+		}
+		if err := process.Signal(syscall.SIGTERM); err != nil {
+			log.Printf("Error sending SIGTERM: %v", err)
 		}
 	}()
 }
@@ -1333,6 +1466,9 @@ func main() {
 
 	// Start periodic token renewal checker
 	startPeriodicTokenRenewal()
+
+	// Start certificate monitoring (if enabled)
+	startCertificateMonitoring()
 
 	// Combined handler for root path - GET for overview, POST for webhooks
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

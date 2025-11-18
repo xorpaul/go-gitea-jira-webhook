@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v0.0.2.html).
 
+## [Unreleased]
+
+### Added
+
+- **Automatic Certificate Reload**: Added periodic monitoring (every 20 minutes) to detect SSL certificate changes and gracefully restart the application
+  - Waits for all buffered tickets to be processed before restarting
+  - Configurable via `auto_reload_certs` setting (enabled by default)
+  - Prevents service interruptions when certificates are renewed
+
 ## [v0.0.7] - 2025-10-10
 
 ### Enhanced
