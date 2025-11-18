@@ -73,9 +73,9 @@ type Config struct {
 		WebhookSecret string `toml:"webhook_secret"` // Optional
 	} `toml:"gitea"`
 	SSL struct {
-		CertFile         string `toml:"cert_file"`
-		KeyFile          string `toml:"key_file"`
-		AutoReloadCerts  bool   `toml:"auto_reload_certs"` // Optional: auto-reload certificates when changed (default: true)
+		CertFile        string `toml:"cert_file"`
+		KeyFile         string `toml:"key_file"`
+		AutoReloadCerts bool   `toml:"auto_reload_certs"` // Optional: auto-reload certificates when changed (default: true)
 	} `toml:"ssl"`
 	Server struct {
 		Port         string   `toml:"port"`          // Can also be hardcoded to 8443
@@ -144,17 +144,17 @@ var (
 	bufferDuration  time.Duration
 
 	// Certificate monitoring variables
-	certModTime     time.Time
-	keyModTime      time.Time
+	certModTime      time.Time
+	keyModTime       time.Time
 	restartRequested bool
-	restartMutex    sync.Mutex
+	restartMutex     sync.Mutex
 )
 
 // loadConfiguration loads and validates the configuration from the specified file
 func loadConfiguration(configPath string) error {
 	// Set defaults before loading config
 	appConfig.SSL.AutoReloadCerts = true // Default to enabled
-	
+
 	// Load configuration from TOML file
 	if _, err := toml.DecodeFile(configPath, &appConfig); err != nil {
 		return fmt.Errorf("error loading configuration from %s: %v", configPath, err)
@@ -574,7 +574,7 @@ func requestRestart() {
 
 	go func() {
 		log.Println("Restart requested. Waiting for buffered tickets to be processed...")
-		
+
 		// Check every 30 seconds if buffer is empty
 		for {
 			bufferMutex.Lock()
@@ -804,6 +804,15 @@ func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
 		ipRestrictions = "Disabled (all IPs allowed)"
 	}
 
+	// Get current buffer status
+	bufferMutex.Lock()
+	bufferedTicketCount := len(bufferedTickets)
+	totalCommitCount := 0
+	for _, bufferedTicket := range bufferedTickets {
+		totalCommitCount += len(bufferedTicket.TicketData.Commits)
+	}
+	bufferMutex.Unlock()
+
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
@@ -833,7 +842,8 @@ func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
         <div class="status">
             <strong>Service Status:</strong> Running ✅<br>
             <strong>Build Version:</strong> %s<br>
-            <strong>Build Time:</strong> %s
+            <strong>Build Time:</strong> %s<br>
+            <strong>Buffered Tickets:</strong> %d ticket(s) with %d commit(s)
         </div>
 
         <h2>📋 Configuration Overview</h2>
@@ -893,7 +903,7 @@ func serviceOverviewHandler(w http.ResponseWriter, r *http.Request) {
         </div>
     </div>
 </body>
-</html>`, buildversion, buildtime, appConfig.Jira.APIURL, appConfig.Jira.Username, projectFilter, visibilitySettings, bufferStatus, webhookSecurity, ipRestrictions, appConfig.Server.Port)
+</html>`, buildversion, buildtime, bufferedTicketCount, totalCommitCount, appConfig.Jira.APIURL, appConfig.Jira.Username, projectFilter, visibilitySettings, bufferStatus, webhookSecurity, ipRestrictions, appConfig.Server.Port)
 
 	fmt.Fprint(w, html)
 	log.Printf("Served service overview to %s", r.RemoteAddr)
