@@ -7,12 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v0.0.2
 
 ## [Unreleased]
 
+## [v0.0.8] - 2025-11-18
+
 ### Added
 
-- **Automatic Certificate Reload**: Added periodic monitoring (every 20 minutes) to detect SSL certificate changes and gracefully restart the application
+- **Buffer Status Display**: Service overview page now displays real-time count of buffered Jira tickets and commit messages ([#2](https://github.com/xorpaul/go-gitea-jira-webhook/pull/2))
+- **Automatic Certificate Reload**: Added periodic monitoring (every 20 minutes) to detect SSL certificate changes and gracefully restart the application ([#1](https://github.com/xorpaul/go-gitea-jira-webhook/pull/1))
   - Waits for all buffered tickets to be processed before restarting
   - Configurable via `auto_reload_certs` setting (enabled by default)
-  - Prevents service interruptions when certificates are renewed
+  - Prevents service interruptions when certificates are renewed (e.g., Let's Encrypt)
 
 ## [v0.0.7] - 2025-10-10
 
